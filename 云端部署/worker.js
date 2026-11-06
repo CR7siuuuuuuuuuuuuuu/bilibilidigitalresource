@@ -1,0 +1,2860 @@
+// ==========================================
+// 1. 全局默认配置 (环境变量优先级更高)
+// ==========================================
+// 虽然代码这里配置全局变量也能正常运行，但是强烈建议按照下面的方式配置！
+// 在 Cloudflare Worker 面板 -> Settings -> Variables and Secrets 中配置以下变量：
+// 环境变量名：JWT_SECRET, BASIC_USER, BASIC_PASS
+// 未配置 JWT_SECRET 时，为当前 Worker 实例生成随机 UUID 作为临时签名密钥。
+// 注意：实例重启/切换后 UUID 会变化，之前签发的 Token 将失效；长期部署建议配置 JWT_SECRET。
+const FALLBACK_SECRET_KEY = crypto.randomUUID();
+const DEFAULT_USERNAME = ""; // 留空表示不开启 Basic Auth
+const DEFAULT_PASSWORD = ""; // 留空表示不开启 Basic Auth
+
+const textEncoder = new TextEncoder();
+
+// ==========================================
+// 2. 轻量级 JWT 工具库 (需传入动态 Secret)
+// ==========================================
+async function signJWT(payload, secret) {
+	const header = { alg: 'HS256', typ: 'JWT' };
+	const encodedHeader = btoa(JSON.stringify(header)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+	const encodedPayload = btoa(JSON.stringify(payload)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+	const data = textEncoder.encode(`${encodedHeader}.${encodedPayload}`);
+
+	const key = await crypto.subtle.importKey(
+		'raw', textEncoder.encode(secret),
+		{ name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+	);
+	const signature = await crypto.subtle.sign('HMAC', key, data);
+	const encodedSignature = btoa(String.fromCharCode(...new Uint8Array(signature))).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+
+	return `${encodedHeader}.${encodedPayload}.${encodedSignature}`;
+}
+
+async function verifyJWT(token, secret) {
+	try {
+		const parts = token.split('.');
+		if (parts.length !== 3) return null;
+		const [header, payload, signature] = parts;
+
+		const data = textEncoder.encode(`${header}.${payload}`);
+		const key = await crypto.subtle.importKey(
+			'raw', textEncoder.encode(secret),
+			{ name: 'HMAC', hash: 'SHA-256' }, false, ['verify']
+		);
+
+		const sigBytes = Uint8Array.from(atob(signature.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+		const isValid = await crypto.subtle.verify('HMAC', key, sigBytes, data);
+
+		if (!isValid) return null;
+		return JSON.parse(atob(payload.replace(/-/g, '+').replace(/_/g, '/')));
+	} catch (e) {
+		return null;
+	}
+}
+
+// ==========================================
+// 3. 辅助函数：提取根域名
+// ==========================================
+function extractRootDomains(jsonData) {
+	const origins = new Set();
+	origins.add('bilibili.com');
+	origins.add('hdslb.com');
+
+	const jsonStr = typeof jsonData === 'string' ? jsonData : JSON.stringify(jsonData);
+	const urls = jsonStr.match(/https?:\/\/[a-zA-Z0-9.-]+/g) || [];
+
+	urls.forEach(u => {
+		try {
+			const host = new URL(u).hostname;
+			const parts = host.split('.');
+			if (parts.length >= 2) {
+				origins.add(parts.slice(-2).join('.'));
+			} else {
+				origins.add(host);
+			}
+		} catch (e) { }
+	});
+
+	return Array.from(origins);
+}
+
+const CLIPBOARD_META_DEFAULTS = Object.freeze({
+	host: 'api.bilibili.com',
+	path: '/x/share/clipboardMeta',
+	appkey: '1d8b6e7d45233436',
+	appsec: '560c52ccd288fed045859ed18bffd973',
+	accessKey: '',
+	build: '8120200',
+	business: '2026DLCSHARE',
+	cLocale: 'zh_CN',
+	channel: 'oppo',
+	disableRcmd: '0',
+	mobiApp: 'android',
+	platform: 'android',
+	sLocale: 'zh_CN',
+	startPattern: '2',
+	statistics: JSON.stringify({ appId: 1, platform: 3, version: '8.12.0', abtest: '' }),
+	buvid: 'XX7BCF57DD53811EBB19C4D5244C9A6AED9B0',
+	fpLocal: 'd6094207a7f1d83699485edeb563ca9e20240905184123a3b2f31a7fecdecbaf',
+	fpRemote: 'd6094207a7f1d83699485edeb563ca9e20240826150753d5975cd4642dd7d626',
+	sessionId: '3075b492',
+	guestid: '23535158781895',
+	appKeyHeader: 'android64',
+	env: 'prod',
+	userAgent: 'Mozilla/5.0 BiliDroid/8.12.0 (bbcallen@gmail.com) os/android model/Nexus 5 mobi_app/android build/8120200 channel/oppo innerVer/8120210 osVer/7.1.2 network/2',
+	httpEngine: 'cronet'
+});
+
+function httpError(message, status = 400) {
+	const error = new Error(message);
+	error.statusCode = status;
+	return error;
+}
+
+function jsonResponse(data, init = {}) {
+	const headers = new Headers(init.headers || {});
+	if (!headers.has('Content-Type')) {
+		headers.set('Content-Type', 'application/json;charset=UTF-8');
+	}
+	return new Response(JSON.stringify(data), { ...init, headers });
+}
+
+function strictEncode(value) {
+	return encodeURIComponent(String(value)).replace(/[!'()*]/g, ch =>
+		`%${ch.charCodeAt(0).toString(16).toUpperCase()}`
+	);
+}
+
+function wrapBase64ForAndroid(base64Text) {
+	return `${base64Text.match(/.{1,76}/g)?.join('\n') || ''}\n`;
+}
+
+function bytesToBinary(bytes) {
+	let binary = '';
+	const chunkSize = 0x8000;
+	for (let i = 0; i < bytes.length; i += chunkSize) {
+		binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+	}
+	return binary;
+}
+
+function bytesToBase64(bytes) {
+	return btoa(bytesToBinary(bytes));
+}
+
+function generateTraceId() {
+	const bytes = new Uint8Array(16);
+	crypto.getRandomValues(bytes);
+	const full = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+	return `${full}:${full.slice(-16)}:0:0`;
+}
+
+function safeAdd(x, y) {
+	const lsw = (x & 0xffff) + (y & 0xffff);
+	const msw = (x >>> 16) + (y >>> 16) + (lsw >>> 16);
+	return (msw << 16) | (lsw & 0xffff);
+}
+
+function bitRotateLeft(num, cnt) {
+	return (num << cnt) | (num >>> (32 - cnt));
+}
+
+function md5Cmn(q, a, b, x, s, t) {
+	return safeAdd(bitRotateLeft(safeAdd(safeAdd(a, q), safeAdd(x, t)), s), b);
+}
+
+function md5Ff(a, b, c, d, x, s, t) {
+	return md5Cmn((b & c) | (~b & d), a, b, x, s, t);
+}
+
+function md5Gg(a, b, c, d, x, s, t) {
+	return md5Cmn((b & d) | (c & ~d), a, b, x, s, t);
+}
+
+function md5Hh(a, b, c, d, x, s, t) {
+	return md5Cmn(b ^ c ^ d, a, b, x, s, t);
+}
+
+function md5Ii(a, b, c, d, x, s, t) {
+	return md5Cmn(c ^ (b | ~d), a, b, x, s, t);
+}
+
+function binlMd5(words, bitLength) {
+	words[bitLength >> 5] |= 0x80 << (bitLength % 32);
+	words[(((bitLength + 64) >>> 9) << 4) + 14] = bitLength;
+
+	let a = 1732584193;
+	let b = -271733879;
+	let c = -1732584194;
+	let d = 271733878;
+
+	for (let i = 0; i < words.length; i += 16) {
+		const oldA = a;
+		const oldB = b;
+		const oldC = c;
+		const oldD = d;
+
+		a = md5Ff(a, b, c, d, words[i + 0], 7, -680876936);
+		d = md5Ff(d, a, b, c, words[i + 1], 12, -389564586);
+		c = md5Ff(c, d, a, b, words[i + 2], 17, 606105819);
+		b = md5Ff(b, c, d, a, words[i + 3], 22, -1044525330);
+		a = md5Ff(a, b, c, d, words[i + 4], 7, -176418897);
+		d = md5Ff(d, a, b, c, words[i + 5], 12, 1200080426);
+		c = md5Ff(c, d, a, b, words[i + 6], 17, -1473231341);
+		b = md5Ff(b, c, d, a, words[i + 7], 22, -45705983);
+		a = md5Ff(a, b, c, d, words[i + 8], 7, 1770035416);
+		d = md5Ff(d, a, b, c, words[i + 9], 12, -1958414417);
+		c = md5Ff(c, d, a, b, words[i + 10], 17, -42063);
+		b = md5Ff(b, c, d, a, words[i + 11], 22, -1990404162);
+		a = md5Ff(a, b, c, d, words[i + 12], 7, 1804603682);
+		d = md5Ff(d, a, b, c, words[i + 13], 12, -40341101);
+		c = md5Ff(c, d, a, b, words[i + 14], 17, -1502002290);
+		b = md5Ff(b, c, d, a, words[i + 15], 22, 1236535329);
+
+		a = md5Gg(a, b, c, d, words[i + 1], 5, -165796510);
+		d = md5Gg(d, a, b, c, words[i + 6], 9, -1069501632);
+		c = md5Gg(c, d, a, b, words[i + 11], 14, 643717713);
+		b = md5Gg(b, c, d, a, words[i + 0], 20, -373897302);
+		a = md5Gg(a, b, c, d, words[i + 5], 5, -701558691);
+		d = md5Gg(d, a, b, c, words[i + 10], 9, 38016083);
+		c = md5Gg(c, d, a, b, words[i + 15], 14, -660478335);
+		b = md5Gg(b, c, d, a, words[i + 4], 20, -405537848);
+		a = md5Gg(a, b, c, d, words[i + 9], 5, 568446438);
+		d = md5Gg(d, a, b, c, words[i + 14], 9, -1019803690);
+		c = md5Gg(c, d, a, b, words[i + 3], 14, -187363961);
+		b = md5Gg(b, c, d, a, words[i + 8], 20, 1163531501);
+		a = md5Gg(a, b, c, d, words[i + 13], 5, -1444681467);
+		d = md5Gg(d, a, b, c, words[i + 2], 9, -51403784);
+		c = md5Gg(c, d, a, b, words[i + 7], 14, 1735328473);
+		b = md5Gg(b, c, d, a, words[i + 12], 20, -1926607734);
+
+		a = md5Hh(a, b, c, d, words[i + 5], 4, -378558);
+		d = md5Hh(d, a, b, c, words[i + 8], 11, -2022574463);
+		c = md5Hh(c, d, a, b, words[i + 11], 16, 1839030562);
+		b = md5Hh(b, c, d, a, words[i + 14], 23, -35309556);
+		a = md5Hh(a, b, c, d, words[i + 1], 4, -1530992060);
+		d = md5Hh(d, a, b, c, words[i + 4], 11, 1272893353);
+		c = md5Hh(c, d, a, b, words[i + 7], 16, -155497632);
+		b = md5Hh(b, c, d, a, words[i + 10], 23, -1094730640);
+		a = md5Hh(a, b, c, d, words[i + 13], 4, 681279174);
+		d = md5Hh(d, a, b, c, words[i + 0], 11, -358537222);
+		c = md5Hh(c, d, a, b, words[i + 3], 16, -722521979);
+		b = md5Hh(b, c, d, a, words[i + 6], 23, 76029189);
+		a = md5Hh(a, b, c, d, words[i + 9], 4, -640364487);
+		d = md5Hh(d, a, b, c, words[i + 12], 11, -421815835);
+		c = md5Hh(c, d, a, b, words[i + 15], 16, 530742520);
+		b = md5Hh(b, c, d, a, words[i + 2], 23, -995338651);
+
+		a = md5Ii(a, b, c, d, words[i + 0], 6, -198630844);
+		d = md5Ii(d, a, b, c, words[i + 7], 10, 1126891415);
+		c = md5Ii(c, d, a, b, words[i + 14], 15, -1416354905);
+		b = md5Ii(b, c, d, a, words[i + 5], 21, -57434055);
+		a = md5Ii(a, b, c, d, words[i + 12], 6, 1700485571);
+		d = md5Ii(d, a, b, c, words[i + 3], 10, -1894986606);
+		c = md5Ii(c, d, a, b, words[i + 10], 15, -1051523);
+		b = md5Ii(b, c, d, a, words[i + 1], 21, -2054922799);
+		a = md5Ii(a, b, c, d, words[i + 8], 6, 1873313359);
+		d = md5Ii(d, a, b, c, words[i + 15], 10, -30611744);
+		c = md5Ii(c, d, a, b, words[i + 6], 15, -1560198380);
+		b = md5Ii(b, c, d, a, words[i + 13], 21, 1309151649);
+		a = md5Ii(a, b, c, d, words[i + 4], 6, -145523070);
+		d = md5Ii(d, a, b, c, words[i + 11], 10, -1120210379);
+		c = md5Ii(c, d, a, b, words[i + 2], 15, 718787259);
+		b = md5Ii(b, c, d, a, words[i + 9], 21, -343485551);
+
+		a = safeAdd(a, oldA);
+		b = safeAdd(b, oldB);
+		c = safeAdd(c, oldC);
+		d = safeAdd(d, oldD);
+	}
+
+	return [a, b, c, d];
+}
+
+function bytesToWords(bytes) {
+	const output = new Array(((bytes.length + 3) >> 2)).fill(0);
+	for (let i = 0; i < bytes.length; i++) {
+		output[i >> 2] |= bytes[i] << ((i % 4) * 8);
+	}
+	return output;
+}
+
+function wordsToHex(words) {
+	const hex = '0123456789abcdef';
+	let output = '';
+	for (let i = 0; i < words.length * 4; i++) {
+		const value = (words[i >> 2] >> ((i % 4) * 8)) & 0xff;
+		output += hex[(value >>> 4) & 0x0f] + hex[value & 0x0f];
+	}
+	return output;
+}
+
+function md5Hex(text) {
+	const bytes = textEncoder.encode(text);
+	return wordsToHex(binlMd5(bytesToWords(bytes), bytes.length * 8));
+}
+
+function extractUrlFromText(input) {
+	const match = String(input || '').match(/https?:\/\/[^\s"'<>]+/i);
+	if (!match) return null;
+	return match[0].replace(/[)\]}>"'.,!?，。！？】》」]+$/u, '');
+}
+
+function extractActAndLottery(input) {
+	const candidate = extractUrlFromText(input) || String(input || '').trim();
+	try {
+		const parsed = new URL(candidate);
+		const actId = parsed.searchParams.get('act_id') || parsed.searchParams.get('id');
+		const lotteryId = parsed.searchParams.get('lottery_id');
+		if (!actId || !lotteryId) return null;
+		return { actId, lotteryId, resolvedUrl: parsed.toString() };
+	} catch (error) {
+		return null;
+	}
+}
+
+function looksLikeClipboardShareText(input) {
+	return /^[A-Za-z0-9]+\$[^$]+\$/.test(String(input || '').trim());
+}
+
+function getClipboardMetaConfig(env, plaintext) {
+	const buvid = env.BILI_BUVID || CLIPBOARD_META_DEFAULTS.buvid;
+	const businessFromText = String(plaintext || '').split('$')[0]?.trim();
+	const encryptionKey = env.BILI_ENCRYPTION_KEY || buvid.slice(0, 32);
+	const encryptionIv = env.BILI_ENCRYPTION_IV || buvid.slice(0, 16);
+
+	return {
+		host: CLIPBOARD_META_DEFAULTS.host,
+		path: CLIPBOARD_META_DEFAULTS.path,
+		appkey: env.BILI_APPKEY || CLIPBOARD_META_DEFAULTS.appkey,
+		appsec: env.BILI_APPSEC || CLIPBOARD_META_DEFAULTS.appsec,
+		accessKey: env.BILI_ACCESS_KEY || CLIPBOARD_META_DEFAULTS.accessKey,
+		build: env.BILI_BUILD || CLIPBOARD_META_DEFAULTS.build,
+		business: env.BILI_BUSINESS || businessFromText || CLIPBOARD_META_DEFAULTS.business,
+		cLocale: env.BILI_C_LOCALE || CLIPBOARD_META_DEFAULTS.cLocale,
+		channel: env.BILI_CHANNEL || CLIPBOARD_META_DEFAULTS.channel,
+		disableRcmd: env.BILI_DISABLE_RCMD || CLIPBOARD_META_DEFAULTS.disableRcmd,
+		mobiApp: env.BILI_MOBI_APP || CLIPBOARD_META_DEFAULTS.mobiApp,
+		platform: env.BILI_PLATFORM || CLIPBOARD_META_DEFAULTS.platform,
+		sLocale: env.BILI_S_LOCALE || CLIPBOARD_META_DEFAULTS.sLocale,
+		startPattern: env.BILI_START_PATTERN || CLIPBOARD_META_DEFAULTS.startPattern,
+		statistics: env.BILI_STATISTICS || CLIPBOARD_META_DEFAULTS.statistics,
+		plaintext,
+		encryptionKey,
+		encryptionIv,
+		headers: {
+			buvid,
+			fpLocal: env.BILI_FP_LOCAL || CLIPBOARD_META_DEFAULTS.fpLocal,
+			fpRemote: env.BILI_FP_REMOTE || CLIPBOARD_META_DEFAULTS.fpRemote,
+			sessionId: env.BILI_SESSION_ID || CLIPBOARD_META_DEFAULTS.sessionId,
+			guestid: env.BILI_GUEST_ID || CLIPBOARD_META_DEFAULTS.guestid,
+			env: env.BILI_ENV || CLIPBOARD_META_DEFAULTS.env,
+			appKeyHeader: env.BILI_APP_KEY_HEADER || CLIPBOARD_META_DEFAULTS.appKeyHeader,
+			userAgent: env.BILI_USER_AGENT || CLIPBOARD_META_DEFAULTS.userAgent,
+			traceId: env.BILI_TRACE_ID || '',
+			ticket: env.BILI_X_BILI_TICKET || '',
+			httpEngine: env.BILI_HTTP_ENGINE || CLIPBOARD_META_DEFAULTS.httpEngine
+		}
+	};
+}
+
+async function encryptClipboardPlaintext(plaintext, keyText, ivText) {
+	const keyBytes = textEncoder.encode(keyText);
+	const ivBytes = textEncoder.encode(ivText);
+
+	if (![16, 24, 32].includes(keyBytes.length)) {
+		throw httpError('Invalid clipboard encryption key length.', 500);
+	}
+	if (ivBytes.length !== 16) {
+		throw httpError('Invalid clipboard encryption IV length.', 500);
+	}
+
+	const cryptoKey = await crypto.subtle.importKey(
+		'raw',
+		keyBytes,
+		{ name: 'AES-CBC' },
+		false,
+		['encrypt']
+	);
+
+	const encryptedBuffer = await crypto.subtle.encrypt(
+		{ name: 'AES-CBC', iv: ivBytes },
+		cryptoKey,
+		textEncoder.encode(plaintext)
+	);
+
+	return wrapBase64ForAndroid(bytesToBase64(new Uint8Array(encryptedBuffer)));
+}
+
+async function resolveClipboardShareUrl(plaintext, env) {
+	const config = getClipboardMetaConfig(env, plaintext);
+	const encryptedData = await encryptClipboardPlaintext(
+		config.plaintext,
+		config.encryptionKey,
+		config.encryptionIv
+	);
+
+	const params = {
+		access_key: config.accessKey,
+		appkey: config.appkey,
+		build: config.build,
+		business: config.business,
+		c_locale: config.cLocale,
+		channel: config.channel,
+		data: encryptedData,
+		disable_rcmd: config.disableRcmd,
+		mobi_app: config.mobiApp,
+		platform: config.platform,
+		s_locale: config.sLocale,
+		start_pattern: config.startPattern,
+		statistics: config.statistics,
+		ts: Math.floor(Date.now() / 1000).toString()
+	};
+
+	const orderedKeys = Object.keys(params).sort();
+	const query = orderedKeys
+		.map(key => `${strictEncode(key)}=${strictEncode(params[key])}`)
+		.join('&');
+	const sign = md5Hex(query + config.appsec);
+	const target = `https://${config.host}${config.path}?${query}&sign=${sign}`;
+
+	const headers = new Headers({
+		Accept: 'application/json',
+		'app-key': config.headers.appKeyHeader,
+		'bili-http-engine': config.headers.httpEngine,
+		buvid: config.headers.buvid,
+		env: config.headers.env,
+		fp_local: config.headers.fpLocal,
+		fp_remote: config.headers.fpRemote,
+		guestid: config.headers.guestid,
+		session_id: config.headers.sessionId,
+		'user-agent': config.headers.userAgent,
+		'x-bili-trace-id': config.headers.traceId || generateTraceId()
+	});
+
+	if (config.headers.ticket) {
+		headers.set('x-bili-ticket', config.headers.ticket);
+	}
+
+	const response = await fetch(target, { method: 'GET', headers, redirect: 'follow' });
+	const responseText = await response.text();
+
+	let payload;
+	try {
+		payload = JSON.parse(responseText);
+	} catch (error) {
+		throw httpError(`clipboardMeta returned non-JSON response (${response.status}).`, 502);
+	}
+
+	if (!response.ok || payload?.code !== 0) {
+		throw httpError(
+			payload?.message || payload?.msg || `clipboardMeta request failed with HTTP ${response.status}.`,
+			response.ok ? 502 : response.status
+		);
+	}
+
+	const resolvedUrl = payload?.data?.url;
+	if (!resolvedUrl) {
+		throw httpError('clipboardMeta response missing data.url.', 502);
+	}
+
+	return resolvedUrl;
+}
+
+async function resolveShareInput(input, env) {
+	const trimmed = String(input || '').trim();
+	if (!trimmed) {
+		throw httpError('Input is required.', 400);
+	}
+
+	const directMatch = extractActAndLottery(trimmed);
+	if (directMatch) {
+		return { inputType: 'url', ...directMatch };
+	}
+
+	if (!looksLikeClipboardShareText(trimmed)) {
+		throw httpError('Unable to find a valid bilibili share URL or supported clipboard text.', 400);
+	}
+
+	const resolvedUrl = await resolveClipboardShareUrl(trimmed, env);
+	const resolvedMatch = extractActAndLottery(resolvedUrl);
+	if (!resolvedMatch) {
+		throw httpError('clipboardMeta returned a URL without act_id or lottery_id.', 502);
+	}
+
+	return { inputType: 'clipboard_text', ...resolvedMatch };
+}
+
+async function readRequestInput(request) {
+	if (request.method !== 'POST') return '';
+
+	const contentType = request.headers.get('Content-Type') || '';
+	if (contentType.includes('application/json')) {
+		const body = await request.clone().json().catch(() => null);
+		return typeof body?.input === 'string' ? body.input : '';
+	}
+
+	if (contentType.includes('text/plain')) {
+		return request.clone().text();
+	}
+
+	return '';
+}
+
+async function fetchBilibiliJson(target, label) {
+	const response = await fetch(target);
+	const responseText = await response.text();
+
+	let data;
+	try {
+		data = JSON.parse(responseText);
+	} catch (error) {
+		throw httpError(`${label} returned non-JSON response (${response.status}).`, 502);
+	}
+
+	if (!response.ok || data?.code !== 0) {
+		throw httpError(
+			data?.message || data?.msg || `${label} failed with HTTP ${response.status}.`,
+			response.ok ? 502 : response.status
+		);
+	}
+
+	return data;
+}
+
+export default {
+	async fetch(request, env, ctx) {
+		// ==========================================
+		// 初始化环境变量 (环境配置优先于代码全局变量)
+		// ==========================================
+		const SECRET_KEY = env.JWT_SECRET?.trim() || FALLBACK_SECRET_KEY;
+		const AUTH_USER = env.BASIC_USER || DEFAULT_USERNAME;
+		const AUTH_PASS = env.BASIC_PASS || DEFAULT_PASSWORD;
+
+		// ==========================================
+		// Basic Authorization 鉴权拦截器
+		// ==========================================
+		if (AUTH_USER && AUTH_PASS) {
+			const authHeader = request.headers.get('Authorization');
+			const expectedAuth = 'Basic ' + btoa(`${AUTH_USER}:${AUTH_PASS}`);
+
+			// 预检请求放行，避免跨域报错
+			if (request.method !== 'OPTIONS' && authHeader !== expectedAuth) {
+				return new Response('401 Unauthorized', {
+					status: 401,
+					headers: {
+						'WWW-Authenticate': 'Basic realm="BiliProxy Secure Area", charset="UTF-8"',
+						'Content-Type': 'text/plain;charset=UTF-8'
+					}
+				});
+			}
+		}
+
+		const url = new URL(request.url);
+
+		if (request.method === 'OPTIONS') {
+			return new Response(null, {
+				headers: {
+					'Access-Control-Allow-Origin': '*',
+					'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+					'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+					'Access-Control-Allow-Credentials': 'true'
+				}
+			});
+		}
+
+		// ==========================================
+		// 路由逻辑
+		// ==========================================
+		if (url.pathname === '/api/basic') {
+			const actId = url.searchParams.get('act_id');
+			if (!actId) {
+				return jsonResponse({ error: 'Missing act_id.' }, { status: 400 });
+			}
+
+			try {
+				const target = `https://api.bilibili.com/x/vas/dlc_act/act/basic?act_id=${actId}&csrf=`;
+				const data = await fetchBilibiliJson(target, 'basic API');
+				return jsonResponse(data);
+			} catch (err) {
+				return jsonResponse(
+					{ error: err.message },
+					{ status: err.statusCode || 500 }
+				);
+			}
+		}
+
+		if (url.pathname === '/api/suit') {
+			const itemId = url.searchParams.get('item_id');
+			if (!itemId) {
+				return jsonResponse({ error: 'Missing item_id.' }, { status: 400 });
+			}
+
+			try {
+				const target = `https://api.bilibili.com/x/garb/v2/mall/suit/detail?item_id=${encodeURIComponent(itemId)}&part=suit`;
+				const data = await fetchBilibiliJson(target, 'suit API');
+				return jsonResponse(data);
+			} catch (err) {
+				return jsonResponse(
+					{ error: err.message },
+					{ status: err.statusCode || 500 }
+				);
+			}
+		}
+
+		if (url.pathname === '/api/detail') {
+			let actId = url.searchParams.get('act_id');
+			let lotteryId = url.searchParams.get('lottery_id');
+			let input = url.searchParams.get('input') || '';
+			let resolvedShare = null;
+
+			try {
+				if (!input && (!actId || !lotteryId || request.method === 'POST')) {
+					input = (await readRequestInput(request)).trim();
+				}
+
+				if ((!actId || !lotteryId) && input) {
+					resolvedShare = await resolveShareInput(input, env);
+					actId = actId || resolvedShare.actId;
+					lotteryId = lotteryId || resolvedShare.lotteryId;
+				}
+
+				if (!actId || !lotteryId) {
+					throw httpError('Missing act_id / lottery_id, and no resolvable share input was provided.', 400);
+				}
+
+				const target = `https://api.bilibili.com/x/vas/dlc_act/lottery_home_detail?act_id=${actId}&appkey=1d8b6e7d45233436&disable_rcmd=0&sign=341070dd7b86b7ce7c3655972d9824a7&lottery_id=${lotteryId}&ts=${Math.floor(Date.now() / 1000)}&mobi_app=android&platform=android`;
+				const data = await fetchBilibiliJson(target, 'detail API');
+
+				const allowedDomains = extractRootDomains(data);
+				const token = await signJWT({
+					origins: allowedDomains,
+					exp: Math.floor(Date.now() / 1000) + (60 * 60 * 2)
+				}, SECRET_KEY);
+
+				const headers = new Headers({
+					'Set-Cookie': `BiliProxyToken=${token}; Path=/; HttpOnly; SameSite=Strict`
+				});
+				if (resolvedShare?.resolvedUrl) {
+					headers.set('X-Bili-Resolved-Url', resolvedShare.resolvedUrl);
+				}
+
+				return jsonResponse(data, { headers });
+			} catch (err) {
+				return jsonResponse(
+					{ error: err.message },
+					{ status: err.statusCode || 500 }
+				);
+			}
+		}
+
+		if (url.pathname === '/proxy') {
+			const targetUrlStr = url.searchParams.get('url');
+			if (!targetUrlStr) return new Response('Missing target URL', { status: 400 });
+
+			const cookieHeader = request.headers.get('Cookie') || '';
+			const match = cookieHeader.match(/BiliProxyToken=([^;]+)/);
+			if (!match) return new Response('403 Forbidden: Missing Token', { status: 403 });
+
+			const payload = await verifyJWT(match[1], SECRET_KEY);
+			if (!payload || !payload.origins || payload.exp < Math.floor(Date.now() / 1000)) {
+				return new Response('403 Forbidden: Invalid or Expired Token', { status: 403 });
+			}
+
+			try {
+				const targetUrl = new URL(targetUrlStr);
+				const parts = targetUrl.hostname.split('.');
+				const rootDomain = parts.length >= 2 ? parts.slice(-2).join('.') : targetUrl.hostname;
+
+				if (!payload.origins.includes(rootDomain)) {
+					return new Response(`403 Forbidden: Domain ${rootDomain} not allowed`, { status: 403 });
+				}
+
+				const newHeaders = new Headers(request.headers);
+				newHeaders.set('Origin', 'https://www.bilibili.com');
+				newHeaders.set('Referer', 'https://www.bilibili.com/');
+				newHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+				newHeaders.delete('Cookie');
+				newHeaders.delete('Authorization'); // 防止 Basic Auth 头部传给目标站
+
+				const proxyRequest = new Request(targetUrl, {
+					method: request.method,
+					headers: newHeaders,
+					redirect: 'follow'
+				});
+
+				const response = await fetch(proxyRequest);
+				return new Response(response.body, {
+					status: response.status,
+					headers: {
+						...Object.fromEntries(response.headers),
+						'Access-Control-Allow-Origin': '*',
+						'Access-Control-Allow-Credentials': 'true'
+					}
+				});
+			} catch (error) {
+				return new Response(`Proxy Error: ${error.message}`, { status: 500 });
+			}
+		}
+
+		if (url.pathname === '/') {
+			return new Response(htmlContent, {
+				headers: { 'Content-Type': 'text/html;charset=UTF-8' },
+			});
+		}
+
+		return new Response('Not Found', { status: 404 });
+	}
+};
+
+// ==========================================
+// 4. 前端 HTML 源码
+// ==========================================
+const htmlContent = `
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+	<meta charset="utf-8" />
+        <meta name="referrer" content="no-referrer" />
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>B站装扮与数字周边提取工具</title>
+	<style>
+		*, *::before, *::after {
+			box-sizing: border-box;
+		}
+		:root {
+		    --primary: #10b981;
+		    --primary-glow: rgba(16, 185, 129, 0.3);
+		    --bg-color: #ffffff;
+		    --panel-bg: #ffffff;
+		    --text-main: #1f2937;
+		    --text-muted: #6b7280;
+		    --border-color: #e5e7eb;
+		    --border-radius: 12px;
+		}
+		body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: var(--bg-color); color: var(--text-main); margin: 0; padding: 20px; line-height: 1.6; display: flex; flex-direction: column; justify-content: center; min-height: 100vh; box-sizing: border-box; }
+		.container { width: 100%; max-width: 1200px; margin: auto; }
+		.panel { background: var(--panel-bg); padding: 30px; border-radius: var(--border-radius); box-shadow: 0 4px 20px rgba(0,0,0,0.06); margin-bottom: 24px; border: 1px solid var(--border-color); }
+		h1, h2 { color: var(--text-main); margin-top: 0; display: flex; align-items: center; justify-content: space-between; }
+		.github-icon { color: var(--text-main); transition: color 0.3s ease, filter 0.3s ease; display: flex; align-items: center; }
+		.github-icon:hover { color: var(--primary); filter: drop-shadow(0 0 8px var(--primary-glow)); }
+		.step-container { margin-bottom: 24px; }
+		.step-title { font-size: 1.1em; font-weight: bold; margin-bottom: 12px; display: flex; align-items: center; gap: 10px; color: var(--primary); }
+		.step-badge { background: var(--primary); color: #fff; width: 24px; height: 24px; border-radius: 50%; display: inline-flex; justify-content: center; align-items: center; font-size: 14px; box-shadow: 0 0 8px var(--primary-glow); }
+		textarea { width: 100%; box-sizing: border-box; background: #ffffff; border: 1px solid var(--border-color); color: var(--text-main); padding: 15px; border-radius: 8px; resize: vertical; font-family: monospace; transition: all 0.3s; }
+		textarea:focus { border-color: var(--primary); outline: none; box-shadow: 0 0 0 3px var(--primary-glow); }
+		a {text-decoration: none; color: #1CBD87;      font-weight: bold; }
+		button { background: var(--primary); color: #fff; border: none; padding: 10px 24px; border-radius: 8px; cursor: pointer; font-weight: bold; font-size: 15px; transition: all 0.3s ease; box-shadow: 0 4px 12px var(--primary-glow); }
+		button:hover { background: #059669; transform: translateY(-2px); }
+		button:disabled { background: #94a3b8; cursor: not-allowed; box-shadow: none; transform: none; }
+		#videos-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 20px; margin-top: 20px; }
+		.media-card { background: #ffffff; border-radius: var(--border-radius); overflow: hidden; display: flex; flex-direction: column; align-items: center; align-self: start; border: 1px solid var(--border-color); transition: transform 0.3s, border-color 0.3s, box-shadow 0.3s; }
+		.media-card:hover { transform: scale(1.02); border-color: var(--primary); box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); }
+		.media-card video, .media-card img { width: 100%; height: 380px; object-fit: cover; background: #f3f4f6; }
+		.media-card > img, .suit-media-card > img { cursor: zoom-in; }
+		.image-modal { position: fixed; inset: 0; z-index: 9999; display: none; align-items: center; justify-content: center; overflow: hidden; user-select: none; opacity: 0; transition: opacity 0.22s ease; }
+		.image-modal.active { display: flex; opacity: 1; }
+		.image-modal-backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.88); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); cursor: zoom-out; }
+		.image-modal-content { position: relative; z-index: 1; display: flex; align-items: center; justify-content: center; max-width: 92vw; max-height: 90vh; pointer-events: none; }
+		.image-modal img { max-width: 92vw; max-height: 90vh; object-fit: contain; border-radius: 8px; box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6); pointer-events: auto; cursor: grab; transform-origin: center center; transition: transform 0.08s ease-out; will-change: transform; }
+		.image-modal img:active, .image-modal.is-dragging img { cursor: grabbing; transition: none; }
+		.image-modal-close { position: absolute; top: 18px; right: 18px; z-index: 2; width: 42px; height: 42px; border-radius: 50%; background: rgba(255, 255, 255, 0.16); border: 1px solid rgba(255, 255, 255, 0.28); color: #fff; font-size: 26px; line-height: 1; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: all 0.2s ease; padding: 0; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35); }
+		.image-modal-close:hover { background: rgba(255, 255, 255, 0.32); transform: scale(1.1); }
+		.image-modal-footer { position: absolute; bottom: 22px; left: 50%; transform: translateX(-50%); z-index: 2; display: flex; flex-direction: column; align-items: center; gap: 10px; pointer-events: none; }
+		.image-modal-laser-hint { padding: 6px 16px; border-radius: 999px; background: rgba(15, 23, 42, 0.82); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.25); color: #f8fafc; font-size: 13px; font-weight: bold; box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45); white-space: nowrap; letter-spacing: 0.2px; pointer-events: none; }
+		.image-modal-toolbar { display: flex; align-items: center; gap: 8px; padding: 6px 14px; border-radius: 999px; background: rgba(15, 23, 42, 0.78); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.18); box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4); pointer-events: auto; }
+		.image-modal-btn { width: 32px; height: 32px; border-radius: 50%; border: 1px solid rgba(255, 255, 255, 0.2); background: rgba(255, 255, 255, 0.15); color: #fff; font-size: 16px; font-weight: bold; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; padding: 0; transition: all 0.2s ease; box-shadow: none; }
+		.image-modal-btn:hover { background: var(--primary); border-color: var(--primary); transform: scale(1.1); }
+		.image-modal-tip { color: #cbd5e1; font-size: 12px; margin-left: 6px; white-space: nowrap; pointer-events: none; }
+		.image-modal-laser-wrapper { position: relative; display: flex; align-items: center; justify-content: center; max-width: 92vw; max-height: 86vh; aspect-ratio: 2 / 3; pointer-events: auto; border-radius: 12px; overflow: hidden; box-shadow: 0 24px 60px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.15); background: #0f172a; cursor: crosshair; touch-action: none; user-select: none; }
+		.image-modal-laser-wrapper canvas { display: block; width: 100%; height: 100%; max-width: 92vw; max-height: 86vh; aspect-ratio: 2 / 3; object-fit: contain; }
+		@media (max-width: 640px) {
+			.image-modal-tip { display: none; }
+			.image-modal-footer { bottom: 16px; gap: 8px; width: calc(100% - 32px); max-width: 380px; }
+			.image-modal-laser-hint { font-size: 12px; padding: 5px 12px; text-align: center; white-space: normal; }
+			.image-modal-toolbar { padding: 6px 12px; }
+			.image-modal-close { top: 14px; right: 14px; width: 38px; height: 38px; font-size: 22px; }
+			.image-modal-laser-wrapper { max-width: 92vw; max-height: 80vh; }
+			.image-modal-laser-wrapper canvas { max-width: 92vw; max-height: 80vh; }
+		}
+		.laser-preview { width: 100%; background: #0f172a; }
+		.laser-stage { position: relative; width: 100%; aspect-ratio: 2 / 3; overflow: hidden; background: #0f172a; touch-action: none; cursor: crosshair; }
+		.laser-stage canvas { display: block; width: 100%; height: 100%; }
+		.laser-badge { position: absolute; top: 10px; left: 10px; z-index: 2; padding: 4px 9px; border: 1px solid rgba(255,255,255,0.55); border-radius: 999px; color: #fff; background: rgba(15,23,42,0.68); box-shadow: 0 4px 14px rgba(0,0,0,0.2); backdrop-filter: blur(6px); font-size: 12px; font-weight: bold; pointer-events: none; }
+		.laser-status { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 20px; box-sizing: border-box; color: #e2e8f0; background: #0f172a; font-size: 13px; text-align: center; }
+		.laser-status button, .media-retry button { padding: 8px 14px; box-shadow: none; }
+		.media-retry { width: 100%; height: 380px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 20px; box-sizing: border-box; color: var(--text-muted); background: #f3f4f6; text-align: center; }
+		.laser-actions { display: flex; gap: 8px; padding: 9px; background: #f8fafc; border-top: 1px solid var(--border-color); }
+		.laser-actions button { flex: 1; padding: 8px 10px; border-radius: 6px; font-size: 13px; font-weight: 500; box-shadow: none; }
+		.laser-actions .secondary { color: var(--text-main); background: #e2e8f0; }
+		.laser-actions .secondary:hover { background: #cbd5e1; }
+		 .media-card video:fullscreen { object-fit: contain; background: #000; }
+		.media-card video:-webkit-full-screen { object-fit: contain; background: #000; }
+		.media-card video:-moz-full-screen { object-fit: contain; background: #000; }
+		.media-card .title { padding: 12px; font-size: 0.9em; text-align: center; color: var(--text-muted); width: 100%; box-sizing: border-box; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; background: #ffffff; border-top: 1px solid var(--border-color); }
+		.progress-wrapper { display: none; margin: 20px 0; background: #ffffff; padding: 15px; border-radius: 8px; border: 1px solid var(--border-color); }
+		progress { width: 100%; height: 12px; border-radius: 6px; appearance: none; overflow: hidden; margin-bottom: 8px; }
+		progress::-webkit-progress-bar { background-color: #f1f5f9; }
+		progress::-webkit-progress-value { background-color: var(--primary); }
+		#progressText { color: var(--primary); font-weight: bold; font-size: 0.9em; }
+		.result-title-area { display: flex; flex-direction: column; align-items: flex-start; gap: 7px; }
+		.result-hints { color: var(--text-muted); font-size: 15px; font-weight: bold; line-height: 1.45; text-align: left; }
+		.result-hints span { display: block; }
+		.result-hints span + span { margin-top: 2px; }
+		#lottery-selection-panel { display:none; margin-bottom:24px; border:1px solid var(--primary); border-radius:var(--border-radius); padding:20px; background:linear-gradient(135deg, #f0fdf4, #ecfdf5); }
+		#lottery-buttons { display:flex; gap:12px; flex-wrap:wrap; margin-top:14px; }
+		#lottery-buttons button { background:linear-gradient(135deg, #10b981, #059669); padding:12px 22px; border-radius:10px; font-size:14px; min-width:120px; }
+		#lottery-buttons button:hover { background:linear-gradient(135deg, #059669, #047857); }
+		#lottery-buttons button.recommended { box-shadow: 0 0 0 2px #fbbf24, 0 4px 16px rgba(251,191,36,0.35); position:relative; }
+		.header-actions { display:flex; align-items:center; gap:12px; }
+		.api-select { min-height:36px; padding:0 15px 0 12px; border:2px solid var(--border-color); border-radius:999px; color:var(--text-main); background:#fff; font:inherit; font-size:13px; font-weight:bold; cursor:pointer; }
+		.mode-switch { display:inline-flex; padding:3px; border:1px solid var(--border-color); border-radius:999px; background:#f1f5f9; box-shadow:inset 0 1px 2px rgba(15,23,42,.06); }
+		.mode-switch button { padding:6px 13px; border-radius:999px; color:var(--text-muted); background:transparent; box-shadow:none; font-size:13px; }
+		.mode-switch button:hover { color:var(--text-main); background:#e2e8f0; transform:none; }
+		.mode-switch button.active { color:#fff; background:var(--primary); box-shadow:0 3px 9px var(--primary-glow); }
+		.result-content[hidden] { display:none !important; }
+		#suit-resources-grid { display:flex; flex-direction:column; gap:18px; margin-top:20px; }
+		.category-section { display:flex; align-items:stretch; gap:16px; padding:16px; border:1px solid var(--border-color); border-radius:var(--border-radius); background:#fff; }
+		.category-title { flex:0 0 128px; display:flex; align-items:center; justify-content:center; align-content:center; flex-wrap:wrap; gap:8px; padding-right:14px; border-right:2px solid var(--primary); color:var(--primary); font-size:1.05em; font-weight:bold; text-align:center; }
+		.count-badge { padding:2px 8px; border-radius:10px; color:#fff; background:var(--primary); font-size:12px; }
+		.category-media-grid { flex:1; min-width:0; display:grid; grid-template-columns:repeat(auto-fill, minmax(220px, 1fr)); gap:16px; }
+		.suit-media-card img, .suit-media-card video { width:100%; height:280px; padding:8px; box-sizing:border-box; object-fit:contain; background:#f3f4f6; }
+		.suit-media-card video { padding:0; }
+		.suit-media-card .media-retry { height:280px; }
+
+		@media (max-width: 640px) {
+			body {
+				padding: 12px;
+				justify-content: flex-start;
+			}
+
+			.panel {
+				padding: 18px 14px;
+				margin-bottom: 16px;
+				border-radius: 10px;
+			}
+
+			h1 {
+				flex-direction: column;
+				align-items: stretch;
+				gap: 12px;
+				margin-bottom: 14px;
+			}
+
+			#page-title,
+			h1 > span:first-child {
+				font-size: 1.25rem;
+				line-height: 1.35;
+				word-break: break-word;
+			}
+
+			.header-actions {
+				display: flex;
+				align-items: center;
+				justify-content: space-between;
+				flex-wrap: wrap;
+				gap: 8px 10px;
+				width: 100%;
+			}
+
+			.api-select {
+				flex: 1 1 auto;
+				min-width: 125px;
+				max-width: 100%;
+				font-size: 12px;
+				padding: 0 10px;
+			}
+
+			.mode-switch {
+				flex-shrink: 0;
+			}
+
+			.mode-switch button {
+				padding: 5px 11px;
+				font-size: 12px;
+			}
+
+			.github-icon {
+				flex-shrink: 0;
+			}
+
+			.step-title {
+				font-size: 1rem;
+			}
+
+			.step-container > div[style*="text-align: right"] button,
+			#fetch-btn {
+				width: 100%;
+				padding: 11px 16px;
+				font-size: 15px;
+				box-sizing: border-box;
+			}
+
+			#lottery-buttons {
+				gap: 8px;
+			}
+
+			#lottery-buttons button {
+				flex: 1 1 calc(50% - 8px);
+				min-width: 120px;
+				padding: 10px 12px;
+				font-size: 13px;
+			}
+
+			#result-title {
+				align-items: stretch;
+				flex-direction: column;
+				gap: 12px;
+			}
+
+			.result-title-area {
+				align-items: flex-start;
+				margin-left: 0;
+			}
+
+			#result-name {
+				font-size: 1.15rem;
+				line-height: 1.35;
+				word-break: break-word;
+			}
+
+			.result-hints {
+				font-size: 13px;
+			}
+
+			#download-btn {
+				width: 100%;
+				padding: 12px 16px;
+				box-sizing: border-box;
+			}
+
+			#videos-grid {
+				grid-template-columns: 1fr;
+				gap: 14px;
+			}
+
+			.media-card video,
+			.media-card img,
+			.media-retry {
+				height: auto;
+				aspect-ratio: 2 / 3;
+			}
+
+			.laser-actions {
+				gap: 8px;
+				padding: 10px;
+			}
+
+			.laser-actions button {
+				padding: 9px 8px;
+				font-size: 13.5px;
+				font-weight: bold;
+			}
+
+			.category-section {
+				flex-direction: column;
+				padding: 12px;
+				gap: 12px;
+			}
+
+			.category-title {
+				flex: none;
+				justify-content: flex-start;
+				padding: 0 0 8px;
+				border-right: 0;
+				border-bottom: 2px solid var(--primary);
+				text-align: left;
+				font-size: 1rem;
+			}
+
+			.category-media-grid {
+				grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+				gap: 10px;
+			}
+
+			.suit-media-card img,
+			.suit-media-card video {
+				height: 180px;
+				padding: 6px;
+			}
+
+			.suit-media-card video {
+				padding: 0;
+			}
+
+			.suit-media-card .media-retry {
+				height: 180px;
+			}
+		}
+	</style>
+</head>
+<body>
+	<div class="container">
+		<div class="panel">
+			<h1>
+				<span>B站装扮与数字周边提取工具</span>
+				<span class="header-actions">
+					<select id="api-provider" class="api-select" aria-label="请求接口">
+						<option value="corsbridge" selected>CorsBridge接口</option>
+						<option value="cloudflare">Cloudflare接口</option>
+					</select>
+					<span class="mode-switch" aria-label="提取模式">
+						<button type="button" class="active" data-mode="auto" onclick="switchMode('auto')">自动</button>
+						<button type="button" data-mode="manual" onclick="switchMode('manual')">手动</button>
+					</span>
+					<a href="https://github.com/Iskongkongyo" target="_blank" rel="noopener noreferrer" class="github-icon" title="访问我的 GitHub 主页">
+					<svg height="28" width="28" viewBox="0 0 16 16" fill="currentColor">
+						<path
+							d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z">
+						</path>
+					</svg>
+					</a>
+				</span>
+			</h1>
+			<p style="color: var(--text-muted); font-size: 0.9em; margin-top: 0;"><span id="mode-description">自动模式会通过所选接口代理请求并直接渲染。</span>打开<a id="mall-link" class="mall-link" href="bilibili://forward?-Btarget=https%3A%2F%2Fwww.bilibili.com%2Fh5%2Fmall%2Fhome%3Fnavhide%3D1">个性装扮(点我跳转)</a>，在装扮商城里进入想要下载的个性装扮，点击右上角分享获取链接。</p>
+			<div class="step-container">
+				<div class="step-title"><span class="step-badge">1</span> 粘贴商品链接</div>
+				<p style="color: var(--text-muted); font-size: 0.9em; margin-top: 0;">支持个性装扮内绝大多数商品的链接；系统会根据链接自动识别类型。</p>
+				<textarea id="source-url" rows="4" placeholder="例如：数字周边活动链接、分享文本和个性装扮链接"></textarea>
+				<div style="margin-top: 10px; text-align: right;">
+					<button id="fetch-btn" onclick="getData()">一键智能解析</button>
+				</div>
+			</div>
+			<div id="lottery-selection-panel">
+				<div class="step-title"><span class="step-badge">⚡</span> 检测到多个数字周边</div>
+				<p style="color: var(--text-muted); font-size: 0.9em; margin-top: 0;">该活动包含多个数字周边，请选择要提取的：</p>
+				<div id="lottery-buttons"></div>
+			</div>
+			<div class="step-container">
+				<div class="step-title"><span class="step-badge">2</span> 接口数据</div>
+				<p style="color: var(--text-muted); font-size: 0.9em; margin-top: 0;">自动模式会填充并渲染；手动模式请将接口页完整 JSON 粘贴到这里，系统会自动识别资源类型。</p>
+				<textarea id="data" rows="6" placeholder="正常情况下无需手动粘贴..."></textarea>
+				<div style="margin-top: 10px; text-align: right;">
+					<button onclick="renderPastedData()">识别并渲染资源</button>
+				</div>
+			</div>
+		</div>
+		<div id="result-panel" class="panel" style="display: none;">
+			<h2 id="result-title">
+				<span class="result-title-area">
+					<span id="result-name">提取结果</span>
+					<span id="result-hints" class="result-hints">
+						<span>PC端快捷键 S：鼠标位于任意数字周边上时，可单独下载该图片、视频或当前镭射效果的图片。</span>
+						<span>镭射图等图片均可点击放大查看！！！镭射预览仅供参考，实际效果可能与 B 站存在差异！</span>
+					</span>
+				</span>
+				<button id="download-btn" onclick="downloadCurrentResult()">打包下载全部</button>
+			</h2>
+			<div id="progress-container" class="progress-wrapper"><progress id="download-progress" max="100" value="0"></progress>
+				<div id="progressText">准备下载...</div>
+			</div>
+			<div id="videos-grid" class="result-content"></div>
+			<div id="suit-resources-grid" class="result-content" hidden></div>
+		</div>
+	</div>
+
+	<div id="image-modal" class="image-modal" aria-hidden="true">
+		<div class="image-modal-backdrop" onclick="closeImageModal()"></div>
+		<div class="image-modal-content">
+			<img id="image-modal-img" alt="放大预览" draggable="false">
+			<div id="image-modal-laser-wrapper" class="image-modal-laser-wrapper" style="display: none;">
+				<canvas id="image-modal-laser-canvas"></canvas>
+			</div>
+		</div>
+		<div class="image-modal-footer">
+			<div id="modal-laser-hint" class="image-modal-laser-hint" style="display: none;">✦ 动态镭射全屏预览（移动或晃动体验光效）</div>
+			<div class="image-modal-toolbar">
+				<button type="button" id="modal-zoom-in-btn" class="image-modal-btn" onclick="zoomImageModal(1.25)" title="放大">+</button>
+				<button type="button" id="modal-zoom-out-btn" class="image-modal-btn" onclick="zoomImageModal(0.8)" title="缩小">−</button>
+				<button type="button" id="modal-reset-btn" class="image-modal-btn" onclick="resetImageModalZoom()" title="重置">↺</button>
+				<button type="button" id="modal-laser-toggle-btn" class="image-modal-btn" style="display: none; width: auto; padding: 0 14px; border-radius: 999px; font-size: 13.5px;" onclick="toggleModalLaser()">关闭镭射</button>
+				<button type="button" id="modal-laser-save-btn" class="image-modal-btn" style="display: none; width: auto; padding: 0 14px; border-radius: 999px; font-size: 13.5px;" onclick="saveModalLaser()">保存效果</button>
+				<span id="modal-tip-text" class="image-modal-tip">滚轮缩放 / 拖拽平移</span>
+			</div>
+		</div>
+		<button type="button" class="image-modal-close" onclick="closeImageModal()" aria-label="关闭预览" title="关闭 (ESC)">×</button>
+	</div>
+
+	<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.7.1/jszip.min.js"></script>
+	<script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+	<script>
+		let zipName = '数字周边';
+		let fileUrls = [];
+		let fileNames = [];
+		let laserControlFiles = [];
+		let laserAssetPairs = [];
+		let isDownloading = false;
+		const laserRenderers = new Set();
+		const singleDownloadsInProgress = new WeakSet();
+		let laserAnimationFrame = null;
+		const laserVisibilityObserver = typeof IntersectionObserver === 'function'
+		    ? new IntersectionObserver(entries => {
+		        entries.forEach(entry => {
+		            if (entry.target._laserRenderer) {
+		                entry.target._laserRenderer.visible = entry.isIntersecting;
+		            }
+		        });
+		    }, { rootMargin: '200px 0px' })
+		    : null;
+		const laserMotionButtons = new Set();
+		let laserMotionEnabled = false;
+		let laserMotionListening = false;
+		let laserMotionBaseline = null;
+		let activeMode = 'auto';
+		let activeResult = null;
+		let suitResources = [];
+		let suitZipName = '装扮资源';
+
+		function isMobileOrTablet() {
+			const ua = navigator.userAgent || navigator.vendor || window.opera || '';
+			const mobileRegex = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile|mobile|Tablet|tablet|iPad|PlayBook|Silk|(windows phone)/i;
+			const isIPadOS = /Macintosh/i.test(ua) && navigator.maxTouchPoints && navigator.maxTouchPoints > 1;
+			const isSmallScreenTouch = (('ontouchstart' in window) || navigator.maxTouchPoints > 0) && window.matchMedia('(max-width: 1024px)').matches;
+			return mobileRegex.test(ua) || isIPadOS || isSmallScreenTouch;
+		}
+
+		function initMallLink() {
+			const mallLinks = document.querySelectorAll('#mall-link, .mall-link');
+			if (!mallLinks.length) return;
+			const isMobile = isMobileOrTablet();
+			const href = isMobile
+				? 'bilibili://forward?-Btarget=https%3A%2F%2Fwww.bilibili.com%2Fh5%2Fmall%2Fhome%3Fnavhide%3D1'
+				: 'https://www.bilibili.com/h5/mall/home?navhide=1&from=icon.shop&f_source=shop';
+			const text = '个性装扮(点我跳转)';
+
+			mallLinks.forEach(link => {
+				link.href = href;
+				link.innerText = text;
+				if (isMobile) {
+					link.removeAttribute('target');
+					link.removeAttribute('rel');
+				} else {
+					link.target = '_blank';
+					link.rel = 'noopener noreferrer';
+				}
+			});
+		}
+
+		initMallLink();
+		if (document.readyState === 'loading') {
+			document.addEventListener('DOMContentLoaded', initMallLink);
+		}
+
+		function switchMode(mode) {
+			if (!['auto', 'manual'].includes(mode) || mode === activeMode) return;
+			if (isDownloading) { alert('当前有正在进行的下载任务，请完成后再切换模式。'); return; }
+			activeMode = mode;
+			const automatic = mode === 'auto';
+			document.getElementById('mode-description').innerText = automatic
+				? '自动模式会通过所选接口请求并直接渲染。'
+				: '手动模式不会请求代理。点击按钮后会直接打开对应 B 站接口，请复制完整 JSON 再粘贴到下方渲染。';
+			document.getElementById('fetch-btn').innerText = automatic ? '一键智能解析' : '打开对应接口';
+			document.querySelectorAll('[data-mode]').forEach(button => button.classList.toggle('active', button.dataset.mode === mode));
+		}
+
+		function getSelectedApiProvider() {
+			return document.getElementById('api-provider').value;
+		}
+
+		function downloadCurrentResult() {
+			return activeResult === 'suit' ? downloadSuitFilesAsZip() : downloadFilesAsZip();
+		}
+
+		const modalState = {
+			scale: 1,
+			translateX: 0,
+			translateY: 0,
+			isDragging: false,
+			startX: 0,
+			startY: 0,
+			initialTranslateX: 0,
+			initialTranslateY: 0,
+			initialDistance: 0,
+			initialScale: 1
+		};
+
+		function applyModalTransform(smooth = true) {
+			const modalImg = document.getElementById('image-modal-img');
+			const laserWrapper = document.getElementById('image-modal-laser-wrapper');
+			const targetEl = modalLaserRenderer ? laserWrapper : modalImg;
+			if (!targetEl) return;
+			targetEl.style.transition = smooth ? 'transform 0.08s ease-out' : 'none';
+			targetEl.style.transform = 'translate(' + modalState.translateX + 'px, ' + modalState.translateY + 'px) scale(' + modalState.scale + ')';
+			if (!modalLaserRenderer) {
+				targetEl.style.cursor = modalState.scale > 1 ? 'grab' : 'zoom-in';
+			}
+		}
+
+		function zoomImageModal(factor) {
+			let newScale = modalState.scale * factor;
+			newScale = Math.max(0.5, Math.min(8, newScale));
+			if (Math.abs(newScale - 1) < 0.05 && factor < 1.05 && factor > 0.95) {
+				newScale = 1;
+			}
+			modalState.scale = newScale;
+			if (newScale <= 1) {
+				modalState.translateX = 0;
+				modalState.translateY = 0;
+			}
+			applyModalTransform(true);
+		}
+
+		function resetImageModalZoom() {
+			modalState.scale = 1;
+			modalState.translateX = 0;
+			modalState.translateY = 0;
+			applyModalTransform(true);
+		}
+
+		let modalLaserRenderer = null;
+
+		function openLaserModal(sourceRenderer, titleText = '镭射款') {
+			const modal = document.getElementById('image-modal');
+			const modalImg = document.getElementById('image-modal-img');
+			const laserWrapper = document.getElementById('image-modal-laser-wrapper');
+			const laserCanvas = document.getElementById('image-modal-laser-canvas');
+			const laserHint = document.getElementById('modal-laser-hint');
+			const tipText = document.getElementById('modal-tip-text');
+			const zoomInBtn = document.getElementById('modal-zoom-in-btn');
+			const zoomOutBtn = document.getElementById('modal-zoom-out-btn');
+			const resetBtn = document.getElementById('modal-reset-btn');
+			const toggleBtn = document.getElementById('modal-laser-toggle-btn');
+			const saveBtn = document.getElementById('modal-laser-save-btn');
+
+			if (!modal || !laserWrapper || !laserCanvas || !sourceRenderer?.ready) return;
+
+			if (modalLaserRenderer) {
+				laserRenderers.delete(modalLaserRenderer);
+				modalLaserRenderer = null;
+			}
+
+			modalImg.style.display = 'none';
+			laserWrapper.style.display = 'flex';
+
+			if (laserHint) laserHint.style.display = 'block';
+			if (zoomInBtn) zoomInBtn.style.display = 'inline-flex';
+			if (zoomOutBtn) zoomOutBtn.style.display = 'inline-flex';
+			if (resetBtn) resetBtn.style.display = 'inline-flex';
+			if (toggleBtn) {
+				toggleBtn.style.display = 'inline-flex';
+				toggleBtn.innerText = sourceRenderer.enabled ? '关闭镭射' : '开启镭射';
+			}
+			if (saveBtn) saveBtn.style.display = 'inline-flex';
+			if (tipText) tipText.style.display = 'none';
+
+			const width = Math.min(1080, sourceRenderer.canvas.width || 828);
+			const height = Math.round(width * (sourceRenderer.canvas.height || 1242) / (sourceRenderer.canvas.width || 828));
+			laserCanvas.width = width;
+			laserCanvas.height = height;
+
+			modalLaserRenderer = {
+				stage: laserWrapper,
+				canvas: laserCanvas,
+				context: laserCanvas.getContext('2d'),
+				maskCanvas: sourceRenderer.maskCanvas,
+				effectCanvas: sourceRenderer.effectCanvas,
+				baseImage: sourceRenderer.baseImage,
+				config: sourceRenderer.config,
+				pointerX: sourceRenderer.pointerX,
+				pointerY: sourceRenderer.pointerY,
+				enabled: sourceRenderer.enabled,
+				visible: true,
+				ready: true,
+				titleText: titleText,
+				sourceRenderer: sourceRenderer
+			};
+			laserRenderers.add(modalLaserRenderer);
+
+			resetImageModalZoom();
+			modal.classList.add('active');
+			modal.setAttribute('aria-hidden', 'false');
+			document.body.style.overflow = 'hidden';
+
+			drawLaserFrame(modalLaserRenderer, performance.now());
+			startLaserAnimation();
+		}
+
+		function toggleModalLaser() {
+			if (!modalLaserRenderer) return;
+			modalLaserRenderer.enabled = !modalLaserRenderer.enabled;
+			if (modalLaserRenderer.sourceRenderer) {
+				modalLaserRenderer.sourceRenderer.enabled = modalLaserRenderer.enabled;
+			}
+			const btn = document.getElementById('modal-laser-toggle-btn');
+			if (btn) btn.innerText = modalLaserRenderer.enabled ? '关闭镭射' : '开启镭射';
+			drawLaserFrame(modalLaserRenderer, performance.now());
+		}
+
+		async function saveModalLaser() {
+			if (!modalLaserRenderer) return;
+			try {
+				await saveLaserPreview(modalLaserRenderer, modalLaserRenderer.titleText);
+			} catch (err) {
+				alert('保存失败：' + err.message);
+			}
+		}
+
+		function openImageModal(src, alt = '放大预览') {
+			const modal = document.getElementById('image-modal');
+			const modalImg = document.getElementById('image-modal-img');
+			const laserWrapper = document.getElementById('image-modal-laser-wrapper');
+			const laserHint = document.getElementById('modal-laser-hint');
+			const tipText = document.getElementById('modal-tip-text');
+			const zoomInBtn = document.getElementById('modal-zoom-in-btn');
+			const zoomOutBtn = document.getElementById('modal-zoom-out-btn');
+			const resetBtn = document.getElementById('modal-reset-btn');
+			const toggleBtn = document.getElementById('modal-laser-toggle-btn');
+			const saveBtn = document.getElementById('modal-laser-save-btn');
+
+			if (!modal || !modalImg || !src) return;
+
+			if (modalLaserRenderer) {
+				laserRenderers.delete(modalLaserRenderer);
+				modalLaserRenderer = null;
+			}
+
+			modalImg.style.display = 'block';
+			if (laserWrapper) laserWrapper.style.display = 'none';
+			if (laserHint) laserHint.style.display = 'none';
+
+			if (zoomInBtn) zoomInBtn.style.display = 'inline-flex';
+			if (zoomOutBtn) zoomOutBtn.style.display = 'inline-flex';
+			if (resetBtn) resetBtn.style.display = 'inline-flex';
+			if (toggleBtn) toggleBtn.style.display = 'none';
+			if (saveBtn) saveBtn.style.display = 'none';
+			if (tipText) {
+				tipText.style.display = '';
+				tipText.innerText = '滚轮缩放 / 拖拽平移';
+			}
+
+			modalImg.src = src;
+			modalImg.alt = alt || '放大预览';
+			resetImageModalZoom();
+			modal.classList.add('active');
+			modal.setAttribute('aria-hidden', 'false');
+			document.body.style.overflow = 'hidden';
+		}
+
+		function closeImageModal() {
+			const modal = document.getElementById('image-modal');
+			if (!modal || !modal.classList.contains('active')) return;
+
+			if (modalLaserRenderer) {
+				laserRenderers.delete(modalLaserRenderer);
+				modalLaserRenderer = null;
+			}
+
+			const laserHint = document.getElementById('modal-laser-hint');
+			if (laserHint) laserHint.style.display = 'none';
+
+			modal.classList.remove('active');
+			modal.setAttribute('aria-hidden', 'true');
+			document.body.style.overflow = '';
+			resetImageModalZoom();
+		}
+
+		const imageModalEl = document.getElementById('image-modal');
+		const imageModalImgEl = document.getElementById('image-modal-img');
+		const imageModalLaserWrapperEl = document.getElementById('image-modal-laser-wrapper');
+
+		const startModalDrag = (clientX, clientY) => {
+			modalState.isDragging = true;
+			modalState.startX = clientX;
+			modalState.startY = clientY;
+			modalState.initialTranslateX = modalState.translateX;
+			modalState.initialTranslateY = modalState.translateY;
+			imageModalEl?.classList.add('is-dragging');
+		};
+
+		if (imageModalEl) {
+			imageModalEl.addEventListener('wheel', event => {
+				event.preventDefault();
+				const zoomFactor = event.deltaY < 0 ? 1.15 : 0.87;
+				zoomImageModal(zoomFactor);
+			}, { passive: false });
+		}
+
+		if (imageModalImgEl) {
+			imageModalImgEl.addEventListener('mousedown', event => {
+				if (event.button !== 0) return;
+				event.preventDefault();
+				startModalDrag(event.clientX, event.clientY);
+			});
+
+			imageModalImgEl.addEventListener('dblclick', event => {
+				event.preventDefault();
+				if (modalState.scale > 1.05) {
+					resetImageModalZoom();
+				} else {
+					modalState.scale = 2.5;
+					applyModalTransform(true);
+				}
+			});
+		}
+
+		if (imageModalLaserWrapperEl) {
+			const updateModalLaserPointer = (clientX, clientY) => {
+				if (!modalLaserRenderer) return;
+				const rect = imageModalLaserWrapperEl.getBoundingClientRect();
+				modalLaserRenderer.pointerX = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+				modalLaserRenderer.pointerY = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
+				if (modalLaserRenderer.sourceRenderer) {
+					modalLaserRenderer.sourceRenderer.pointerX = modalLaserRenderer.pointerX;
+					modalLaserRenderer.sourceRenderer.pointerY = modalLaserRenderer.pointerY;
+				}
+				drawLaserFrame(modalLaserRenderer, performance.now());
+			};
+
+			imageModalLaserWrapperEl.addEventListener('pointermove', event => {
+				updateModalLaserPointer(event.clientX, event.clientY);
+			});
+
+			imageModalLaserWrapperEl.addEventListener('mousedown', event => {
+				if (event.button !== 0) return;
+				if (modalState.scale > 1) {
+					event.preventDefault();
+					startModalDrag(event.clientX, event.clientY);
+				}
+			});
+
+			imageModalLaserWrapperEl.addEventListener('dblclick', event => {
+				event.preventDefault();
+				if (modalState.scale > 1.05) {
+					resetImageModalZoom();
+				} else {
+					modalState.scale = 2.5;
+					applyModalTransform(true);
+				}
+			});
+		}
+
+		window.addEventListener('mousemove', event => {
+			if (!modalState.isDragging) return;
+			event.preventDefault();
+			const deltaX = event.clientX - modalState.startX;
+			const deltaY = event.clientY - modalState.startY;
+			modalState.translateX = modalState.initialTranslateX + deltaX;
+			modalState.translateY = modalState.initialTranslateY + deltaY;
+			applyModalTransform(false);
+		});
+
+		window.addEventListener('mouseup', () => {
+			if (modalState.isDragging) {
+				modalState.isDragging = false;
+				imageModalEl?.classList.remove('is-dragging');
+				applyModalTransform(true);
+			}
+		});
+
+		if (imageModalEl) {
+			imageModalEl.addEventListener('touchstart', event => {
+				if (event.touches.length === 1 && modalState.scale > 1) {
+					const touch = event.touches[0];
+					startModalDrag(touch.clientX, touch.clientY);
+				} else if (event.touches.length === 2) {
+					modalState.isDragging = false;
+					const touch1 = event.touches[0];
+					const touch2 = event.touches[1];
+					modalState.initialDistance = Math.hypot(touch2.clientX - touch1.clientX, touch2.clientY - touch1.clientY);
+					modalState.initialScale = modalState.scale;
+				}
+			}, { passive: true });
+
+			imageModalEl.addEventListener('touchmove', event => {
+				if (event.touches.length === 1 && modalLaserRenderer && imageModalLaserWrapperEl) {
+					const rect = imageModalLaserWrapperEl.getBoundingClientRect();
+					modalLaserRenderer.pointerX = Math.max(0, Math.min(1, (event.touches[0].clientX - rect.left) / rect.width));
+					modalLaserRenderer.pointerY = Math.max(0, Math.min(1, (event.touches[0].clientY - rect.top) / rect.height));
+					if (modalLaserRenderer.sourceRenderer) {
+						modalLaserRenderer.sourceRenderer.pointerX = modalLaserRenderer.pointerX;
+						modalLaserRenderer.sourceRenderer.pointerY = modalLaserRenderer.pointerY;
+					}
+					drawLaserFrame(modalLaserRenderer, performance.now());
+				}
+
+				if (event.touches.length === 1 && modalState.isDragging && modalState.scale > 1) {
+					event.preventDefault();
+					const touch = event.touches[0];
+					const deltaX = touch.clientX - modalState.startX;
+					const deltaY = touch.clientY - modalState.startY;
+					modalState.translateX = modalState.initialTranslateX + deltaX;
+					modalState.translateY = modalState.initialTranslateY + deltaY;
+					applyModalTransform(false);
+				} else if (event.touches.length === 2 && modalState.initialDistance > 0) {
+					event.preventDefault();
+					const touch1 = event.touches[0];
+					const touch2 = event.touches[1];
+					const currentDistance = Math.hypot(touch2.clientX - touch1.clientX, touch2.clientY - touch1.clientY);
+					const factor = currentDistance / modalState.initialDistance;
+					modalState.scale = Math.max(0.5, Math.min(8, modalState.initialScale * factor));
+					applyModalTransform(false);
+				}
+			}, { passive: false });
+
+			imageModalEl.addEventListener('touchend', event => {
+				if (event.touches.length === 0) {
+					modalState.isDragging = false;
+					modalState.initialDistance = 0;
+					if (modalState.scale < 1) {
+						resetImageModalZoom();
+					} else {
+						applyModalTransform(true);
+					}
+				}
+			}, { passive: true });
+		}
+
+		document.addEventListener('click', event => {
+			const target = event.target;
+			if (target instanceof HTMLImageElement && target.closest('.media-card') && !target.closest('.laser-stage') && !target.closest('.image-modal')) {
+				openImageModal(target.src, target.alt);
+			}
+		});
+
+		document.addEventListener('keydown', event => {
+			if (event.key === 'Escape') {
+				closeImageModal();
+			}
+		});
+
+		function getScreenOrientationAngle() {
+		    const angle = screen.orientation?.angle ?? window.orientation ?? 0;
+		    return ((Number(angle) % 360) + 360) % 360;
+		}
+		function normalizeTiltDelta(value) {
+		    return ((value + 180) % 360 + 360) % 360 - 180;
+		}
+		function updateLaserMotionButtons(text) {
+		    laserMotionButtons.forEach(button => {
+		        if (button.isConnected) button.innerText = text;
+		    });
+		}
+		function handleLaserDeviceOrientation(event) {
+		    if (!laserMotionEnabled || event.beta == null || event.gamma == null) return;
+		    const angle = getScreenOrientationAngle();
+		    if (!laserMotionBaseline || laserMotionBaseline.angle !== angle) {
+		        laserMotionBaseline = { beta: event.beta, gamma: event.gamma, angle };
+		        updateLaserMotionButtons('晃动已开启');
+		        return;
+		    }
+
+		    const betaDelta = normalizeTiltDelta(event.beta - laserMotionBaseline.beta);
+		    const gammaDelta = normalizeTiltDelta(event.gamma - laserMotionBaseline.gamma);
+		    let horizontal = gammaDelta;
+		    let vertical = betaDelta;
+		    if (angle === 90) {
+		        horizontal = betaDelta;
+		        vertical = -gammaDelta;
+		    } else if (angle === 270) {
+		        horizontal = -betaDelta;
+		        vertical = gammaDelta;
+		    } else if (angle === 180) {
+		        horizontal = -gammaDelta;
+		        vertical = -betaDelta;
+		    }
+
+		    const targetX = Math.max(0, Math.min(1, 0.5 + horizontal / 60));
+		    const targetY = Math.max(0, Math.min(1, 0.5 + vertical / 60));
+		    laserRenderers.forEach(renderer => {
+		        renderer.pointerX += (targetX - renderer.pointerX) * 0.35;
+		        renderer.pointerY += (targetY - renderer.pointerY) * 0.35;
+		    });
+		}
+		async function enableLaserMotion() {
+		    if (typeof DeviceOrientationEvent === 'undefined') {
+		        alert('当前浏览器或设备不支持晃动感应。');
+		        updateLaserMotionButtons('设备不支持晃动');
+		        return;
+		    }
+		    try {
+		        if (!laserMotionEnabled && typeof DeviceOrientationEvent.requestPermission === 'function') {
+		            const permission = await DeviceOrientationEvent.requestPermission();
+		            if (permission !== 'granted') throw new Error('未获得动作与方向访问权限');
+		        }
+		        if (!laserMotionListening) {
+		            window.addEventListener('deviceorientation', handleLaserDeviceOrientation, true);
+		            laserMotionListening = true;
+		        }
+		        laserMotionEnabled = true;
+		        laserMotionBaseline = null;
+		        updateLaserMotionButtons('请晃动手机');
+		    } catch (error) {
+		        alert('无法开启晃动感应：' + error.message);
+		    }
+		}
+		function registerLaserMotionButton(button) {
+		    const isMobileDevice = navigator.userAgentData?.mobile === true ||
+		        /Android|iPhone|iPad|iPod|Mobile|HarmonyOS/i.test(navigator.userAgent) ||
+		        (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+		    const supportsMobileMotion = isMobileDevice &&
+		        typeof DeviceOrientationEvent !== 'undefined';
+		    if (!supportsMobileMotion) {
+		        button.style.display = 'none';
+		        return;
+		    }
+		    laserMotionButtons.add(button);
+		    button.innerText = laserMotionEnabled ? '校准晃动' : '开启晃动';
+		    button.title = '移动端点击授权晃动感应；开启后再次点击可重新校准';
+		    button.addEventListener('click', enableLaserMotion);
+		}
+		function attachMediaRetry(media, url, mediaLabel) {
+                    // B站部分图片和视频会检查 Referer，预览时统一禁止发送。
+	            media.referrerPolicy = 'no-referrer';
+	            media.setAttribute('referrerpolicy', 'no-referrer');
+
+		    let retryPlaceholder = null;
+		    const showRetry = () => {
+		        if (retryPlaceholder) return;
+		        if (!media.isConnected) {
+		            setTimeout(() => {
+		                if (media.isConnected) showRetry();
+		            }, 0);
+		            return;
+		        }
+		        media.style.display = 'none';
+		        retryPlaceholder = document.createElement('div');
+		        retryPlaceholder.className = 'media-retry';
+		        const message = document.createElement('div');
+		        message.innerText = mediaLabel + '加载失败';
+		        const retryButton = document.createElement('button');
+		        retryButton.type = 'button';
+		        retryButton.innerText = '↻ 重新加载';
+		        retryButton.addEventListener('click', () => {
+		            retryPlaceholder.remove();
+		            retryPlaceholder = null;
+		            media.style.display = '';
+		            if (media instanceof HTMLVideoElement) {
+		                media.pause();
+		                media.removeAttribute('src');
+		                media.load();
+		                setTimeout(() => {
+		                    media.src = url;
+		                    media.load();
+		                }, 0);
+		            } else {
+		                media.removeAttribute('src');
+		                setTimeout(() => {
+		                    media.src = url;
+		                }, 0);
+		            }
+		        });
+		        retryPlaceholder.appendChild(message);
+		        retryPlaceholder.appendChild(retryButton);
+		        media.insertAdjacentElement('afterend', retryPlaceholder);
+		    };
+		    media.addEventListener('error', showRetry);
+		}
+		
+		function getParam(url, param) {
+		    try { return new URL(url).searchParams.get(param); } catch (e) { return null; }
+		}
+		function sanitizeFileName(name, fallback = '未命名素材') {
+		    const cleaned = String(name || '').replace(/[\\/:*?"<>|]/g, '').replace(/\s+/g, ' ').trim();
+		    return cleaned || fallback;
+		}
+		function inferExtFromUrlOrBlob(url, blob) {
+		    try {
+		        const urlObj = new URL(url, location.origin);
+		        const match = urlObj.pathname.match(/\.[a-zA-Z0-9]{2,5}$/i);
+		        if (match) return match[0];
+		        const raw = urlObj.searchParams.get('url');
+		        if (raw) {
+		            const originalUrlObj = new URL(raw);
+		            const rawMatch = originalUrlObj.pathname.match(/\.[a-zA-Z0-9]{2,5}$/i);
+		            if (rawMatch) return rawMatch[0];
+		        }
+		    } catch (e) {}
+		    const mime = blob?.type || '';
+		    if (mime.includes('video/mp4')) return '.mp4';
+		    if (mime.includes('video/webm')) return '.webm';
+		    if (mime.includes('image/png')) return '.png';
+		    if (mime.includes('image/webp')) return '.webp';
+		    if (mime.includes('image/gif')) return '.gif';
+		    if (mime.includes('image/jpeg')) return '.jpg';
+		    return mime.startsWith('video/') ? '.mp4' : '.jpg';
+		}
+		function saveLaserPreview(renderer, titleText) {
+		    return new Promise((resolve, reject) => {
+		        if (!renderer?.ready) {
+		            reject(new Error('镭射预览尚未加载完成'));
+		            return;
+		        }
+		        drawLaserFrame(renderer, performance.now());
+		        renderer.canvas.toBlob(blob => {
+		            if (!blob) {
+		                reject(new Error('无法生成当前镭射预览'));
+		                return;
+		            }
+		            saveAs(blob, sanitizeFileName(titleText, '镭射预览') + '_镭射预览.png');
+		            resolve();
+		        }, 'image/png');
+		    });
+		}
+		async function downloadSingleCard(card) {
+		    if (!card || singleDownloadsInProgress.has(card)) return;
+		    const downloadInfo = card._downloadInfo;
+		    const renderer = card.querySelector('.laser-stage')?._laserRenderer;
+		    singleDownloadsInProgress.add(card);
+		    try {
+		        if (renderer?.enabled) {
+		            await saveLaserPreview(renderer, downloadInfo?.title);
+		            return;
+		        }
+		        if (!downloadInfo?.url) throw new Error('没有找到可下载的资源');
+		        const response = await fetchWithRetry(downloadInfo.url, {
+		            referrerPolicy: 'no-referrer'
+		        }, 3, 30000);
+		        const blob = await response.blob();
+		        const extension = inferExtFromUrlOrBlob(downloadInfo.url, blob);
+		        saveAs(blob, sanitizeFileName(downloadInfo.title, '未命名素材') + extension);
+		    } catch (error) {
+		        console.error('单个资源下载失败：', error);
+		        alert('单个资源下载失败：' + error.message);
+		    } finally {
+		        singleDownloadsInProgress.delete(card);
+		    }
+		}
+		document.addEventListener('keydown', event => {
+		    const target = event.target;
+		    const isEditing = target instanceof HTMLElement &&
+		        (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
+		    if (event.code !== 'KeyS' || event.repeat || event.ctrlKey || event.altKey || event.metaKey || isEditing) return;
+		    const hoveredCard = document.querySelector('.media-card:hover');
+		    if (!hoveredCard) return;
+		    event.preventDefault();
+		    downloadSingleCard(hoveredCard);
+		});
+		async function fetchWithRetry(url, options = {}, retries = 3, timeoutMs = 15000) {
+		    for (let i = 0; i < retries; i++) {
+		        const controller = new AbortController();
+		        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+		        try {
+		            const response = await fetch(url, { ...options, credentials: 'same-origin', signal: controller.signal });
+		            clearTimeout(timeoutId);
+		            if (!response.ok) throw new Error(\`HTTP \${response.status}\`);
+		            return response;
+		        } catch (error) {
+		            clearTimeout(timeoutId);
+		            if (i === retries - 1) throw new Error(\`重试 \${retries} 次失败: \${error.message}\`);
+		            await new Promise(resolve => setTimeout(resolve, 1000));
+		        }
+		    }
+		}
+
+		async function fetchJsonByProvider(targetUrl, workerUrl) {
+			const requestUrl = getSelectedApiProvider() === 'cloudflare'
+				? workerUrl
+				: 'https://api.cors.syrins.tech/?url=' + encodeURIComponent(targetUrl);
+			const response = await fetchWithRetry(requestUrl, {}, 3, 15000);
+			try {
+				return await response.json();
+			} catch (error) {
+				throw new Error('请求接口返回的不是有效 JSON：' + error.message);
+			}
+		}
+
+		function getSourceInput() {
+			return document.getElementById('source-url').value.trim();
+		}
+
+		function detectResourceTypeFromUrl(sourceUrl) {
+			const rawUrl = String(sourceUrl || '');
+			let normalized = rawUrl;
+			try { normalized = decodeURIComponent(rawUrl); } catch (error) { console.warn('链接解码失败，将按原链接识别：', error); }
+			normalized = normalized.toLowerCase();
+			const activityId = getParam(rawUrl, 'act_id') || getParam(rawUrl, 'id');
+			const linkType = String(getParam(rawUrl, 'type') || '').toLowerCase();
+			if (normalized.includes('/suit/detail') || normalized.includes('/garb/v2/mall/suit/detail')) return 'suit';
+			if (getParam(rawUrl, 'act_id') || getParam(rawUrl, 'lottery_id') || normalized.includes('/vas/dlc_act/') || (activityId && linkType === 'dlc') || (getParam(rawUrl, 'id') && normalized.includes('/h5/mall/'))) return 'digital';
+			throw new Error('未识别出链接类型。请粘贴数字周边活动分享链接/文本，或包含 suit/detail 的装扮商品链接。');
+		}
+
+		function buildSuitApiUrl(sourceUrl) {
+			const itemId = getParam(sourceUrl, 'id') || getParam(sourceUrl, 'item_id');
+			if (!itemId) throw new Error('装扮链接中未找到 id 或 item_id 参数！');
+			return 'https://api.bilibili.com/x/garb/v2/mall/suit/detail?item_id=' + encodeURIComponent(itemId) + '&part=suit';
+		}
+		
+		function normalizeFilepath(filepath, lotteryId) {
+		    try {
+		        const url = new URL(filepath);
+		        url.searchParams.set("lottery_id", lotteryId);
+		        return url.toString();
+		    } catch {
+		        return filepath; // 不是 URL，保持原样
+		    }
+		}
+		
+		function buildBasicApiUrlFromInput(input) {
+		    const id = getParam(input, 'act_id') || getParam(input, 'id');
+		    if (!id) throw new Error('未找到有效的 act_id / id');
+		    return 'https://api.bilibili.com/x/vas/dlc_act/act/basic?act_id='+encodeURIComponent(id)+'&csrf=';
+		}
+		
+		function buildDetailApiUrl(actId, lotteryId) {
+		    return (
+		'https://api.bilibili.com/x/vas/dlc_act/lottery_home_detail' +
+		'?act_id='+encodeURIComponent(actId) +
+		'&lottery_id='+encodeURIComponent(lotteryId) +
+		'&appkey=1d8b6e7d45233436' +
+		'&disable_rcmd=0' +
+		'&mobi_app=android' +
+		'&platform=android'
+		    );
+		}
+		
+		function showManualFallback(message, inputValue = '') {
+		    const panel = document.getElementById('manual-fallback-panel');
+		    const tip = document.getElementById('manual-error-tip');
+		    const basicUrlBox = document.getElementById('basic-url');
+		
+		    panel.style.display = 'block';
+		    tip.innerText = '自动获取失败：'+message+'。可恶啊，被风控了，B站玩不起喵！已切换到手动模式，请手动继续下面的步骤。';
+		    try {
+		const basicUrl = buildBasicApiUrlFromInput(inputValue);
+		basicUrlBox.value = basicUrl;
+		    } catch (e) {
+		basicUrlBox.value = '';
+		    }
+		
+		    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+		}
+		
+		function openBasicUrl() {
+		    const url = document.getElementById('basic-url').value.trim();
+		    if (!url) {
+		alert('基础接口地址为空，请先输入有效分享链接并触发自动/手动流程。');
+		return;
+		    }
+		    window.open(url, '_blank', 'noopener,noreferrer');
+		}
+		
+		async function copyBasicUrl() {
+		    const url = document.getElementById('basic-url').value.trim();
+		    if (!url) {
+		alert('基础接口地址为空！');
+		return;
+		    }
+		    try {
+		await navigator.clipboard.writeText(url);
+		alert('基础接口地址已复制！');
+		    } catch {
+		alert('复制失败，请手动复制。');
+		    }
+		}
+		
+		function openDetailFromBasic() {
+		    try {
+		const filepath = document.getElementById('filepath').value.trim();
+		if (!filepath) throw new Error('请先填写分享链接或文本');
+		
+		const actId = getParam(filepath, 'act_id') || getParam(filepath, 'id');
+		if (!actId) throw new Error('未找到 act_id / id');
+		
+		const basicText = document.getElementById('basic-data').value.trim();
+		if (!basicText) throw new Error('请先粘贴基础接口 JSON');
+		
+		const basicJson = JSON.parse(basicText);
+		const lotteryList = basicJson?.data?.lottery_list || [];
+		const tabLotteryId = basicJson?.data?.tab_lottery_id;
+		
+		// 多个数字周边 → 显示选择按钮
+		if (lotteryList.length >= 2) {
+		    const selPanel = document.getElementById('manual-lottery-selection');
+		    const btnContainer = document.getElementById('manual-lottery-buttons');
+		    btnContainer.innerHTML = '';
+		    lotteryList.forEach(function(lottery) {
+		        const b = document.createElement('button');
+		        b.innerText = lottery.lottery_name || ('周边 ' + lottery.lottery_id);
+		        if (String(lottery.lottery_id) === String(tabLotteryId)) {
+		            b.classList.add('recommended');
+		            b.innerText += ' ★';
+		        }
+		        b.onclick = function() {
+		            const detailUrl = buildDetailApiUrl(actId, lottery.lottery_id);
+		            document.getElementById('detail-url').value = detailUrl;
+		            selPanel.style.display = 'none';
+		            alert('已选择「' + (lottery.lottery_name || lottery.lottery_id) + '」，已生成媒体接口地址，即将打开新窗口。');
+		            window.open(detailUrl, '_blank', 'noopener,noreferrer');
+		        };
+		        btnContainer.appendChild(b);
+		    });
+		    selPanel.style.display = 'block';
+		    selPanel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+		    return;
+		}
+		
+		// 单个周边 → 直接继续
+		const lotteryId = tabLotteryId || lotteryList[0]?.lottery_id;
+		if (!lotteryId) throw new Error('基础 JSON 中未找到有效 lottery_id');
+		
+		const detailUrl = buildDetailApiUrl(actId, lotteryId);
+		document.getElementById('detail-url').value = detailUrl;
+		
+		alert('已生成媒体接口地址，即将打开新窗口，请复制返回的完整 JSON 后粘贴到第 3 步。');
+		window.open(detailUrl, '_blank', 'noopener,noreferrer');
+		    } catch (err) {
+		alert('解析基础数据失败:' + err.message);
+		    }
+		}
+		
+		function openDetailUrl() {
+		    const url = document.getElementById('detail-url').value.trim();
+		    if (!url) {
+		alert('媒体接口地址为空，请先完成基础数据解析。');
+		return;
+		    }
+		    window.open(url, '_blank', 'noopener,noreferrer');
+		}
+		
+		async function copyDetailUrl() {
+		    const url = document.getElementById('detail-url').value.trim();
+		    if (!url) {
+		alert('媒体接口地址为空！');
+		return;
+		    }
+		    try {
+		await navigator.clipboard.writeText(url);
+		alert('媒体接口地址已复制！');
+		    } catch {
+		alert('复制失败，请手动复制。');
+		    }
+		}
+		
+		async function getDataLegacy() {
+		    const filepath = document.getElementById('filepath').value.trim();
+		    if (!filepath) { alert('输入内容不能为空！'); return; }
+		    const id = getParam(filepath, 'act_id') || getParam(filepath, 'id');
+		    let lotteryId = getParam(filepath, 'lottery_id');
+		    const btn = document.getElementById('fetch-btn');
+		    const originalBtnText = btn.innerText;
+		    btn.innerText = '正在获取安全令牌与数据...';
+		    btn.disabled = true;
+		
+		    try {
+		        // 如果没有 lottery_id，有id的情况下尝试从 basic 接口中提取
+		        if ((!lotteryId || lotteryId == 'undefined' || lotteryId == 'null') && filepath.startsWith('http')) {
+		            if (!id || id == 'undefined' || id == 'null') throw new Error('未找到有效的 id!');
+		            const basicRes = await fetch(\`/api/basic?act_id=\${id}\`);
+		            if (!basicRes.ok) throw new Error('基础接口请求失败!');
+		            const basicData = await basicRes.json();
+		            lotteryId = basicData?.data?.tab_lottery_id || basicData?.data?.lottery_list?.[0]?.lottery_id;
+		            if (!lotteryId) throw new Error('未找到有效的 lottery_id!');
+		        }
+		
+		        const finalPath = normalizeFilepath(filepath, lotteryId);
+		
+		        const detailRes = await fetch('/api/detail', {
+		            method: 'POST',
+		            headers: { 'Content-Type': 'application/json' },
+		            body: JSON.stringify({ input: finalPath })
+		        });
+		        const detailData = await detailRes.json();
+		        if (!detailRes.ok) throw new Error(detailData?.error || '详情接口请求失败!');
+		        document.getElementById('data').value = JSON.stringify(detailData, null, 2);
+		        getVideos();
+		    } catch (err) {
+		        alert(\`自动获取数据失败：\${err.message}\`);
+		    } finally {
+		        btn.innerText = originalBtnText;
+		        btn.disabled = false;
+		    }
+		}
+		function buildDigitalDetailApiUrl(actId, lotteryId) {
+			return 'https://api.bilibili.com/x/vas/dlc_act/lottery_home_detail?act_id=' + encodeURIComponent(actId) + '&appkey=1d8b6e7d45233436&disable_rcmd=0&sign=341070dd7b86b7ce7c3655972d9824a7&lottery_id=' + encodeURIComponent(lotteryId) + '&ts=' + Math.floor(Date.now() / 1000) + '&mobi_app=android&platform=android';
+		}
+		function buildDigitalBasicApiUrl(actId) {
+			return 'https://api.bilibili.com/x/vas/dlc_act/act/basic?act_id=' + encodeURIComponent(actId) + '&csrf=';
+		}
+		function getAvailableLotteries(payload) {
+			const lotteryList = Array.isArray(payload?.lottery_list) ? payload.lottery_list : [];
+			return lotteryList.filter(lottery => lottery?.lottery_id != null && String(lottery.lottery_id).trim() !== '');
+		}
+		function openDigitalDetailApi(actId, lotteryId) {
+			const detailUrl = buildDigitalDetailApiUrl(actId, lotteryId);
+			document.getElementById('lottery-selection-panel').style.display = 'none';
+			alert('即将打开所选数字周边的详情接口，请复制完整 JSON 后粘贴到第 2 步渲染。');
+			window.open(detailUrl, '_blank', 'noopener,noreferrer');
+		}
+		function openManualApi(resourceType) {
+			const source = getSourceInput();
+			if (resourceType === 'suit') { window.open(buildSuitApiUrl(source), '_blank', 'noopener,noreferrer'); return; }
+			const actId = getParam(source, 'act_id') || getParam(source, 'id');
+			if (!actId) throw new Error('数字周边链接中未找到 act_id 或 id！');
+			const apiUrl = buildDigitalBasicApiUrl(actId);
+			alert('即将打开数字周边基础接口（链接自带的 lottery_id 不影响选择）。请复制完整 JSON 并粘贴到第 2 步，工具会列出该活动下的全部数字周边。');
+			window.open(apiUrl, '_blank', 'noopener,noreferrer');
+		}
+		function showLotterySelection(actId, lotteryList, tabLotteryId, selectionMode = 'auto') {
+			const panel = document.getElementById('lottery-selection-panel');
+			const container = document.getElementById('lottery-buttons');
+			container.replaceChildren();
+			lotteryList.forEach(function(lottery) {
+				const button = document.createElement('button');
+				button.innerText = lottery.lottery_name || ('周边 ' + lottery.lottery_id);
+				if (String(lottery.lottery_id) === String(tabLotteryId)) { button.classList.add('recommended'); button.innerText += ' ★'; }
+				button.onclick = function() { selectLottery(actId, lottery.lottery_id, selectionMode); };
+				container.appendChild(button);
+			});
+			panel.style.display = 'block';
+			panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+		}
+		async function fetchAndRenderDetail(actId, lotteryId) {
+			const targetUrl = buildDigitalDetailApiUrl(actId, lotteryId);
+			const workerUrl = '/api/detail?act_id=' + encodeURIComponent(actId) + '&lottery_id=' + encodeURIComponent(lotteryId);
+			const detailData = await fetchJsonByProvider(targetUrl, workerUrl);
+			if (detailData.code != null && detailData.code !== 0) throw new Error(detailData.message || ('API 返回错误：' + detailData.code));
+			document.getElementById('data').value = JSON.stringify(detailData, null, 2);
+			getVideos();
+		}
+		async function selectLottery(actId, lotteryId, selectionMode = 'auto') {
+			if (selectionMode === 'manual') {
+				openDigitalDetailApi(actId, lotteryId);
+				return;
+			}
+
+			const button = document.getElementById('fetch-btn');
+			button.disabled = true; button.innerText = '正在获取数据...';
+			document.getElementById('lottery-selection-panel').style.display = 'none';
+			try { await fetchAndRenderDetail(actId, lotteryId); }
+			catch (error) { alert('自动获取失败：' + error.message + '。请切换手动模式后重试。'); }
+			finally { button.disabled = false; button.innerText = activeMode === 'auto' ? '一键智能解析' : '打开对应接口'; }
+		}
+		async function getDigitalDataAutomatically(source) {
+			const actId = getParam(source, 'act_id') || getParam(source, 'id');
+			if (!actId) throw new Error('数字周边链接中未找到 act_id 或 id！');
+
+			// 无论分享链接是否自带 lottery_id，都以 basic 接口返回的完整列表为准。
+			const targetUrl = buildDigitalBasicApiUrl(actId);
+			const basicData = await fetchJsonByProvider(targetUrl, '/api/basic?act_id=' + encodeURIComponent(actId));
+			if (basicData.code != null && basicData.code !== 0) throw new Error(basicData.message || ('API 返回错误：' + basicData.code));
+			const payload = basicData?.data || {};
+			const lotteryList = getAvailableLotteries(payload);
+			const tabLotteryId = payload.tab_lottery_id;
+			if (lotteryList.length >= 2) { showLotterySelection(actId, lotteryList, tabLotteryId, 'auto'); return; }
+			const lotteryId = tabLotteryId || lotteryList[0]?.lottery_id;
+			if (!lotteryId) throw new Error('基础接口中未找到有效的 lottery_id！');
+			await fetchAndRenderDetail(actId, lotteryId);
+		}
+		async function getSuitDataAutomatically(source) {
+			const targetUrl = buildSuitApiUrl(source);
+			const itemId = getParam(source, 'id') || getParam(source, 'item_id');
+			const data = await fetchJsonByProvider(targetUrl, '/api/suit?item_id=' + encodeURIComponent(itemId));
+			if (data.code != null && data.code !== 0) throw new Error(data.message || ('API 返回错误：' + data.code));
+			document.getElementById('data').value = JSON.stringify(data, null, 2);
+			parseSuitData();
+		}
+		async function getData() {
+			const source = getSourceInput();
+			if (!source) { alert('商品链接不能为空！'); return; }
+			const button = document.getElementById('fetch-btn');
+			try {
+				const resourceType = detectResourceTypeFromUrl(source);
+				document.getElementById('lottery-selection-panel').style.display = 'none';
+				if (activeMode === 'manual') { openManualApi(resourceType); return; }
+				button.disabled = true; button.innerText = '正在自动解析...';
+				if (resourceType === 'suit') await getSuitDataAutomatically(source); else await getDigitalDataAutomatically(source);
+			} catch (error) {
+				alert('自动获取失败：' + error.message + '。可切换手动模式直接打开接口。');
+			} finally {
+				button.disabled = false; button.innerText = activeMode === 'auto' ? '一键智能解析' : '打开对应接口';
+			}
+		}
+		function getVideos() {
+		    try {
+		        const data = document.getElementById('data').value.trim();
+		        if (!data) throw new Error('JSON 数据不能为空！');
+		        const jsonData = JSON.parse(data);
+		        const infos = jsonData?.data || {};
+		        zipName = infos.name || '数字周边';
+		        activeResult = 'digital';
+		        document.getElementById('videos-grid').hidden = false;
+		        document.getElementById('suit-resources-grid').hidden = true;
+		        document.getElementById('result-panel').style.display = 'block';
+		        document.getElementById('result-name').innerText = zipName;
+		        document.getElementById('result-hints').innerHTML = '<span>PC端快捷键 S：鼠标位于某个数字周边上时，可单独下载该图片、视频或当前镭射效果的图片。</span><span>镭射图等图片均可点击放大查看！！！镭射预览仅供参考，实际效果可能与 B 站存在差异！</span>';
+		        const itemList = Array.isArray(infos.item_list) ? [...infos.item_list] : [];
+		        const seen = new Set();
+		        function addImageItem(cardName, cardImg) {
+		            if (!cardImg) return;
+		            const key = \`\${cardName || ''}::\${cardImg}\`;
+		            if (seen.has(key)) return;
+		            seen.add(key);
+		            itemList.push({ card_info: { card_name: cardName, card_img: cardImg } });
+		        }
+		        function addVideoItem(cardName, videoUrl) {
+		            if (!videoUrl) return;
+		            const key = (cardName || '') + '::' + videoUrl;
+		            if (seen.has(key)) return;
+		            seen.add(key);
+		            itemList.push({ card_info: { card_name: cardName, video_list: [videoUrl] } });
+		        }
+		        itemList.forEach(item => {
+		            const cardInfo = item?.card_info;
+		            if (!cardInfo) return;
+		            const key = \`\${cardInfo.card_name || ''}::\${cardInfo.card_img || cardInfo.video_list?.[0] || ''}\`;
+		            seen.add(key);
+		        });
+		        const extraRewardTypeNames = new Set(['评论背景', '典藏卡', '头像挂件']);
+		        const collectChain = Array.isArray(infos.collect_list?.collect_chain)
+		            ? infos.collect_list.collect_chain
+		            : [];
+		        const collectInfos = Array.isArray(infos.collect_list?.collect_infos)
+		            ? infos.collect_list.collect_infos
+		            : [];
+		        [...collectChain, ...collectInfos].forEach(item => {
+		            const itemName = item?.redeem_item_name || '';
+		            const itemTypeName = item?.redeem_item_type_name || '';
+		            const matchesExistingReward =
+		                itemName === '钻石头像背景' || itemName.endsWith('表情包');
+		            const matchesTypeReward = extraRewardTypeNames.has(itemTypeName);
+		            if (matchesExistingReward || matchesTypeReward) {
+		                const baseName = itemName || itemTypeName;
+		                addImageItem(baseName, item?.redeem_item_image);
+		                // 仅「典藏卡」：在图片之外附带对应视频，视频名 = 图片名 + (视频)
+		                if (itemTypeName === '典藏卡') {
+		                    const collectorVideoUrl = item?.card_item?.card_type_info?.content?.animation?.animation_video_urls?.[0];
+		                    if (collectorVideoUrl) {
+		                        addVideoItem(baseName + '(视频)', collectorVideoUrl);
+		                    }
+		                }
+		            }
+		        });
+		        renderGrid(itemList);
+		    } catch (err) {
+		        alert(\`解析数据出错，请确保输入的是完整的 JSON 格式：\${err.message}\`);
+		    }
+		}
+		function extractSuitResources(data) {
+			const resources = [], seen = new Set();
+			const add = (category, name, url, subDir) => { if (url && !seen.has(url)) { seen.add(url); resources.push({ category, name, url, subDir: subDir || category }); } };
+			const addProperties = (category, item, definitions) => { const p = item?.properties || {}; definitions.forEach(def => add(category, def[0], p[def[1]], def[2])); };
+			add('封面', '商品封面', data.properties?.image_cover, '封面'); add('封面', '分享图', data.properties?.fan_share_image, '封面');
+			(data.suit_items?.card || []).forEach(item => { const p=item.properties||{}, name=item.name||'评论卡片'; add('评论卡片',name,p.image,'评论卡片'); add('评论卡片',name+'_缩略图',p.image_preview_small,'评论卡片'); if(p.fans_image!==p.image)add('评论卡片',name+'_粉丝徽章',p.fans_image,'评论卡片'); });
+			(data.suit_items?.card_bg || []).forEach(item => { const p=item.properties||{}, name=item.name||'卡片背景'; add('卡片背景',name,p.image,'卡片背景'); add('卡片背景',name+'_缩略图',p.image_preview_small,'卡片背景'); });
+			(data.suit_items?.emoji_package || []).forEach(pkg => { const p=pkg.properties||{}; add('表情包','表情包封面',p.image,'表情包'); try { JSON.parse(p.item_emoji_list||'[]').forEach(emoji=>add('表情包',emoji.name||'表情',emoji.image,'表情包')); } catch(error) { console.warn('表情包列表解析失败：',error); } (pkg.items||[]).forEach(emoji=>add('表情包',emoji.name?.replace(/[\[\]]/g,'')||'表情',emoji.properties?.image,'表情包')); });
+			(data.suit_items?.skin || []).forEach(item => addProperties('主题皮肤',item,[['皮肤预览图','image_cover'],['顶栏背景','head_bg'],['标签栏背景','head_tab_bg'],['个人页方形背景','head_myself_squared_bg'],['底栏背景','tail_bg'],['个人页动态背景','head_myself_mp4_bg'],['首页图标','tail_icon_main','主题皮肤/底栏图标'],['首页图标_选中','tail_icon_selected_main','主题皮肤/底栏图标'],['动态图标','tail_icon_dynamic','主题皮肤/底栏图标'],['动态图标_选中','tail_icon_selected_dynamic','主题皮肤/底栏图标'],['频道图标','tail_icon_channel','主题皮肤/底栏图标'],['频道图标_选中','tail_icon_selected_channel','主题皮肤/底栏图标'],['我的图标','tail_icon_myself','主题皮肤/底栏图标'],['我的图标_选中','tail_icon_selected_myself','主题皮肤/底栏图标'],['商城图标','tail_icon_shop','主题皮肤/底栏图标'],['商城图标_选中','tail_icon_selected_shop','主题皮肤/底栏图标'],['发布按钮','tail_icon_pub_btn_bg','主题皮肤/底栏图标'],['发布按钮_选中','tail_icon_selected_pub_btn_bg','主题皮肤/底栏图标']]));
+			(data.suit_items?.space_bg || []).forEach(item => addProperties('空间背景',item,[['竖版壁纸1','image1_portrait'],['横版壁纸1','image1_landscape'],['竖版壁纸2','image2_portrait'],['横版壁纸2','image2_landscape'],['竖版动态壁纸1','space_1_mp4_vertical'],['横版动态壁纸1','space_1_mp4_horizontal'],['竖版动态壁纸2','space_2_mp4_vertical'],['横版动态壁纸2','space_2_mp4_horizontal']]));
+			(data.suit_items?.pendant || []).forEach(item => { const p=item.properties||{},name=item.name||'头像挂件'; add('头像挂件',name,p.image,'头像挂件'); add('头像挂件',name+'_缩略图',p.image_preview_small,'头像挂件'); });
+			(data.suit_items?.loading || []).forEach(item => { const p=item.properties||{},name=item.name||'加载动画'; add('加载动画',name,p.loading_url||p.image,'加载动画'); add('加载动画',name+'_缩略图',p.image_preview_small,'加载动画'); });
+			if(data.fan_user?.avatar) add('UP主信息',(data.fan_user.nickname||'UP主')+'_头像',data.fan_user.avatar,'UP主信息');
+			return resources;
+		}
+		function createSuitResourceCard(resource) {
+			const card=document.createElement('div'); card.className='media-card suit-media-card'; card._downloadInfo={title:resource.name,url:resource.url};
+			const resourcePath = resource.url.split('?')[0].toLowerCase();
+			const isArchive = resourcePath.endsWith('.zip'), isVideo = resourcePath.endsWith('.mp4') || resourcePath.endsWith('.webm');
+			if(isArchive) { const placeholder=document.createElement('div'); placeholder.className='media-retry'; placeholder.append('📦 ZIP 离线资源包'); card.appendChild(placeholder); }
+			else if(isVideo) { const video=document.createElement('video'); video.controls=true; video.preload='metadata'; attachMediaRetry(video,resource.url,'视频'); video.src=resource.url; card.appendChild(video); }
+			else { const image=document.createElement('img'); image.alt=resource.name; image.loading='lazy'; attachMediaRetry(image,resource.url,'图片'); image.src=resource.url; card.appendChild(image); }
+			const title=document.createElement('div'); title.className='title'; title.innerText=resource.name; title.title=resource.name; card.appendChild(title); return card;
+		}
+		function renderSuitResourceGrid(resources) {
+			const grid=document.getElementById('suit-resources-grid'); grid.replaceChildren(); const grouped={}; resources.forEach(item=>{(grouped[item.category] ||= []).push(item);});
+			const order=['封面','主题皮肤','空间背景','评论卡片','卡片背景','表情包','头像挂件','加载动画','UP主信息'], icons={'封面':'🎨','主题皮肤':'🎭','空间背景':'🖼️','评论卡片':'💬','卡片背景':'🃏','表情包':'😊','头像挂件':'💎','加载动画':'⏳','UP主信息':'👤'};
+			[...order.filter(category=>grouped[category]),...Object.keys(grouped).filter(category=>!order.includes(category))].forEach(category=>{ const section=document.createElement('section'); section.className='category-section'; const heading=document.createElement('div'); heading.className='category-title'; heading.append((icons[category]||'📦')+' '+category+' '); const count=document.createElement('span'); count.className='count-badge'; count.innerText=grouped[category].length; heading.appendChild(count); const cards=document.createElement('div'); cards.className='category-media-grid'; grouped[category].forEach(resource=>cards.appendChild(createSuitResourceCard(resource))); section.append(heading,cards); grid.appendChild(section); });
+		}
+		function parseSuitData() {
+			try { const raw=document.getElementById('data').value.trim(); if(!raw) throw new Error('JSON 数据不能为空！'); const json=JSON.parse(raw); if(json.code!=null&&json.code!==0)throw new Error(json.message||('API 返回错误：'+json.code)); const data=json.data||json; if(!data?.suit_items&&!data?.properties)throw new Error('未找到有效的装扮数据！'); suitZipName=data.name||'装扮资源'; suitResources=extractSuitResources(data); if(!suitResources.length)throw new Error('未能提取到任何资源！'); activeResult='suit'; document.getElementById('videos-grid').hidden=true; document.getElementById('suit-resources-grid').hidden=false; document.getElementById('result-panel').style.display='block'; document.getElementById('result-name').innerText=suitZipName+'（'+suitResources.length+' 项资源）'; document.getElementById('result-hints').innerHTML = '<span>PC端快捷键 S：鼠标位于任意数字周边上时，可单独下载该图片、视频或当前镭射效果的图片。</span><span>镭射图等图片均可点击放大查看！！！镭射预览仅供参考，实际效果可能与 B 站存在差异！</span>';renderSuitResourceGrid(suitResources); document.getElementById('result-panel').scrollIntoView({behavior:'smooth',block:'start'}); } catch(error) { alert('解析失败：'+error.message); }
+		}
+		function renderPastedData() {
+			try {
+				const raw = document.getElementById('data').value.trim();
+				if (!raw) throw new Error('JSON 数据不能为空！');
+				const json = JSON.parse(raw), payload = json?.data || json;
+				if (Array.isArray(payload?.lottery_list)) {
+					const source = getSourceInput();
+					const actId = getParam(source, 'act_id') || getParam(source, 'id');
+					if (!actId) throw new Error('商品链接中未找到有效的 act_id 或 id！');
+					const lotteryList = getAvailableLotteries(payload);
+					if (lotteryList.length >= 2) {
+						showLotterySelection(actId, lotteryList, payload.tab_lottery_id, 'manual');
+					} else {
+						const lotteryId = payload.tab_lottery_id || lotteryList[0]?.lottery_id;
+						if (!lotteryId) throw new Error('基础接口中未找到有效的 lottery_id！');
+						openDigitalDetailApi(actId, lotteryId);
+					}
+					return;
+				}
+				if (payload?.suit_items || payload?.properties?.image_cover || payload?.properties?.fan_share_image) { parseSuitData(); return; }
+				if (Array.isArray(payload?.item_list) || payload?.collect_list) { getVideos(); return; }
+				throw new Error('JSON 中未识别出装扮资源或数字周边数据。');
+			} catch(error) {
+				alert('识别失败：' + error.message);
+			}
+		}
+		function parseShineConfig(metaInfo) {
+		    const defaults = {
+		        laser_intensity: 1,
+		        skin_protection: 1,
+		        cloth_boost: 0.68,
+		        hue_start: 0,
+		        hue_range: 1
+		    };
+		    try {
+		        const rawConfig = metaInfo?.shine_effect_config;
+		        const parsed = typeof rawConfig === 'string' ? JSON.parse(rawConfig) : rawConfig;
+		        return { ...defaults, ...(parsed || {}) };
+		    } catch (error) {
+		        console.warn('镭射参数解析失败，将使用默认值：', error);
+		        return defaults;
+		    }
+		}
+	      function loadCorsImage(url) {
+	           const load = source => new Promise((resolve, reject) => {
+		   const image = new Image();
+
+		   // 用于镭射卡面的图片请求：禁用 Referer。
+		   image.crossOrigin = 'anonymous';
+		   image.referrerPolicy = 'no-referrer';
+		   image.setAttribute('referrerpolicy', 'no-referrer');
+
+		   image.onload = () => resolve(image);
+		   image.onerror = () => reject(new Error('图片加载失败：' + source));
+		   image.src = source;
+	         });
+
+	           return load(url);
+                      }
+		function positiveModulo(value, divisor) {
+		    return ((value % divisor) + divisor) % divisor;
+		}
+		function drawLaserFrame(renderer, timestamp = 0) {
+		    if (!renderer.ready) return;
+		    const {
+		        canvas, context, baseImage, maskCanvas, effectCanvas,
+		        config, pointerX, pointerY, enabled
+		    } = renderer;
+		    const width = canvas.width;
+		    const height = canvas.height;
+		    context.globalAlpha = 1;
+		    context.globalCompositeOperation = 'source-over';
+		    context.clearRect(0, 0, width, height);
+		    context.drawImage(baseImage, 0, 0, width, height);
+		    if (!enabled) return;
+
+		    const effectContext = effectCanvas.getContext('2d');
+		    const animatedPhase = positiveModulo(timestamp * 0.000045 + pointerX * 0.55 + pointerY * 0.2, 1);
+		    const angle = (-55 + pointerX * 70) * Math.PI / 180;
+		    const centerX = width / 2;
+		    const centerY = height / 2;
+		    const radius = Math.hypot(width, height) * 0.72;
+		    const x0 = centerX - Math.cos(angle) * radius;
+		    const y0 = centerY - Math.sin(angle) * radius;
+		    const x1 = centerX + Math.cos(angle) * radius;
+		    const y1 = centerY + Math.sin(angle) * radius;
+
+		    effectContext.globalAlpha = 1;
+		    effectContext.globalCompositeOperation = 'source-over';
+		    effectContext.clearRect(0, 0, width, height);
+		    const rainbow = effectContext.createLinearGradient(x0, y0, x1, y1);
+		    const colorStops = 10;
+		    for (let index = 0; index <= colorStops; index++) {
+		        const position = index / colorStops;
+		        const hueProgress = positiveModulo(position + animatedPhase, 1);
+		        const hue = positiveModulo(
+		            (Number(config.hue_start) + hueProgress * Number(config.hue_range)) * 360,
+		            360
+		        );
+		        rainbow.addColorStop(position, 'hsl(' + hue + ' 94% 58%)');
+		    }
+		    effectContext.fillStyle = rainbow;
+		    effectContext.fillRect(0, 0, width, height);
+		    effectContext.globalCompositeOperation = 'destination-in';
+		    effectContext.drawImage(maskCanvas, 0, 0);
+
+		    const laserIntensity = Math.max(0, Number(config.laser_intensity) || 0);
+		    context.globalCompositeOperation = 'source-over';
+		    context.globalAlpha = Math.min(0.48, 0.16 + laserIntensity * 0.2);
+		    context.drawImage(effectCanvas, 0, 0);
+		    context.globalCompositeOperation = 'screen';
+		    context.globalAlpha = Math.min(0.38, 0.1 + laserIntensity * 0.16);
+		    context.drawImage(effectCanvas, 0, 0);
+
+		    effectContext.globalCompositeOperation = 'source-over';
+		    effectContext.clearRect(0, 0, width, height);
+		    const shine = effectContext.createLinearGradient(x0, y0, x1, y1);
+		    const shineCenter = positiveModulo(animatedPhase * 1.35, 1);
+		    const shineWidth = 0.075;
+		    const shineStops = [
+		        [0, 'rgba(255,255,255,0)'],
+		        [Math.max(0, shineCenter - shineWidth), 'rgba(255,255,255,0)'],
+		        [shineCenter, 'rgba(255,255,255,0.95)'],
+		        [Math.min(1, shineCenter + shineWidth), 'rgba(255,255,255,0)'],
+		        [1, 'rgba(255,255,255,0)']
+		    ];
+		    shineStops
+		        .sort((left, right) => left[0] - right[0])
+		        .forEach(([position, color]) => shine.addColorStop(position, color));
+		    effectContext.fillStyle = shine;
+		    effectContext.fillRect(0, 0, width, height);
+		    effectContext.globalCompositeOperation = 'destination-in';
+		    effectContext.drawImage(maskCanvas, 0, 0);
+		    context.globalCompositeOperation = 'screen';
+		    context.globalAlpha = Math.min(0.38, 0.12 + laserIntensity * 0.12);
+		    context.drawImage(effectCanvas, 0, 0);
+		    context.globalAlpha = 1;
+		    context.globalCompositeOperation = 'source-over';
+		}
+		function startLaserAnimation() {
+		    if (laserAnimationFrame !== null) return;
+		    const animate = timestamp => {
+		        laserRenderers.forEach(renderer => {
+		            if (renderer.enabled && renderer.ready && renderer.visible && renderer.canvas.isConnected) {
+		                drawLaserFrame(renderer, timestamp);
+		            }
+		        });
+		        laserAnimationFrame = requestAnimationFrame(animate);
+		    };
+		    laserAnimationFrame = requestAnimationFrame(animate);
+		}
+		function createLaserPreview(cardInfo, titleText) {
+		    const metaInfo = cardInfo.meta_info || {};
+		    const config = parseShineConfig(metaInfo);
+		    const preview = document.createElement('div');
+		    preview.className = 'laser-preview';
+		    const stage = document.createElement('div');
+		    stage.className = 'laser-stage';
+		    const canvas = document.createElement('canvas');
+		    canvas.width = 414;
+		    canvas.height = 621;
+		    canvas.setAttribute('aria-label', titleText + ' 镭射款动态预览');
+		    const badge = document.createElement('div');
+		    badge.className = 'laser-badge';
+		    badge.innerText = '✦ 实验性镭射预览';
+		    const status = document.createElement('div');
+		    status.className = 'laser-status';
+		    status.innerText = '正在加载卡面与镭射控制图...';
+		    const actions = document.createElement('div');
+		    actions.className = 'laser-actions';
+		    const toggleButton = document.createElement('button');
+		    toggleButton.type = 'button';
+		    toggleButton.innerText = '关闭镭射';
+		    const motionButton = document.createElement('button');
+		    motionButton.type = 'button';
+		    motionButton.className = 'secondary';
+		    registerLaserMotionButton(motionButton);
+		    const saveButton = document.createElement('button');
+		    saveButton.type = 'button';
+		    saveButton.className = 'secondary';
+		    saveButton.innerText = '保存当前效果';
+		    saveButton.disabled = true;
+
+		    actions.appendChild(toggleButton);
+		    actions.appendChild(motionButton);
+		    actions.appendChild(saveButton);
+		    stage.appendChild(canvas);
+		    stage.appendChild(badge);
+		    stage.appendChild(status);
+		    preview.appendChild(stage);
+		    preview.appendChild(actions);
+
+		    const maskCanvas = document.createElement('canvas');
+		    const effectCanvas = document.createElement('canvas');
+		    const renderer = {
+		        stage,
+		        canvas,
+		        context: canvas.getContext('2d'),
+		        maskCanvas,
+		        effectCanvas,
+		        baseImage: null,
+		        config,
+		        pointerX: 0.5,
+		        pointerY: 0.5,
+		        enabled: true,
+		        visible: true,
+		        ready: false
+		    };
+		    laserRenderers.add(renderer);
+		    stage._laserRenderer = renderer;
+		    laserVisibilityObserver?.observe(stage);
+
+		    const updatePointer = event => {
+		        const rect = stage.getBoundingClientRect();
+		        renderer.pointerX = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+		        renderer.pointerY = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+		    };
+		    stage.addEventListener('pointermove', updatePointer);
+		    stage.addEventListener('click', event => {
+		        if (event.target instanceof HTMLButtonElement) return;
+		        if (renderer.ready) {
+		            openLaserModal(renderer, titleText);
+		        }
+		    });
+		    toggleButton.addEventListener('click', () => {
+		        renderer.enabled = !renderer.enabled;
+		        toggleButton.innerText = renderer.enabled ? '关闭镭射' : '开启镭射';
+		        badge.style.display = renderer.enabled ? 'block' : 'none';
+		        drawLaserFrame(renderer, performance.now());
+		    });
+		    saveButton.addEventListener('click', async () => {
+		        try {
+		            await saveLaserPreview(renderer, titleText);
+		        } catch (error) {
+		            alert('当前镭射预览保存失败：' + error.message);
+		        }
+		    });
+
+		    const loadLaserAssets = () => {
+		        renderer.ready = false;
+		        renderer.enabled = true;
+		        toggleButton.innerText = '关闭镭射';
+		        toggleButton.disabled = true;
+		        motionButton.disabled = true;
+		        saveButton.disabled = true;
+		        badge.style.display = 'block';
+		        canvas.style.display = 'block';
+		        status.style.display = 'flex';
+		        status.replaceChildren(document.createTextNode('正在加载卡面与镭射控制图...'));
+
+		        Promise.all([
+		            loadCorsImage(cardInfo.card_img),
+		            loadCorsImage(metaInfo.upgrade_cover_url)
+		        ]).then(([baseImage, coverImage]) => {
+		            const renderWidth = Math.min(480, baseImage.naturalWidth || baseImage.width);
+		            const renderHeight = Math.round(
+		                renderWidth * (baseImage.naturalHeight || baseImage.height) /
+		                (baseImage.naturalWidth || baseImage.width)
+		            );
+		            canvas.width = renderWidth;
+		            canvas.height = renderHeight;
+		            maskCanvas.width = renderWidth;
+		            maskCanvas.height = renderHeight;
+		            effectCanvas.width = renderWidth;
+		            effectCanvas.height = renderHeight;
+
+		            const maskContext = maskCanvas.getContext('2d', { willReadFrequently: true });
+		            maskContext.drawImage(coverImage, 0, 0, renderWidth, renderHeight);
+		            const maskPixels = maskContext.getImageData(0, 0, renderWidth, renderHeight);
+		            const skinProtection = Math.max(0, Number(config.skin_protection) || 0);
+		            const clothBoost = Math.max(0, Number(config.cloth_boost) || 0);
+		            const maskExponent = 0.82 + skinProtection * 0.34;
+		            const maskBoost = 0.72 + clothBoost * 0.42;
+		            for (let offset = 0; offset < maskPixels.data.length; offset += 4) {
+		                const luminance = (
+		                    maskPixels.data[offset] * 0.2126 +
+		                    maskPixels.data[offset + 1] * 0.7152 +
+		                    maskPixels.data[offset + 2] * 0.0722
+		                ) / 255;
+		                const alpha = Math.min(1, Math.pow(luminance, maskExponent) * maskBoost);
+		                maskPixels.data[offset] = 255;
+		                maskPixels.data[offset + 1] = 255;
+		                maskPixels.data[offset + 2] = 255;
+		                maskPixels.data[offset + 3] = Math.round(alpha * 255);
+		            }
+		            maskContext.putImageData(maskPixels, 0, 0);
+		            renderer.baseImage = baseImage;
+		            renderer.ready = true;
+		            status.style.display = 'none';
+		            toggleButton.disabled = false;
+		            motionButton.disabled = false;
+		            saveButton.disabled = false;
+		            drawLaserFrame(renderer, performance.now());
+		            startLaserAnimation();
+		        }).catch(error => {
+		            console.error('镭射预览加载失败：', error);
+		            renderer.enabled = false;
+		            canvas.style.display = 'none';
+		            badge.style.display = 'none';
+		            toggleButton.disabled = true;
+		            motionButton.disabled = true;
+		            saveButton.disabled = true;
+		            status.replaceChildren();
+		            const message = document.createElement('div');
+		            message.innerText = '镭射预览加载失败\\n' + error.message;
+		            const retryButton = document.createElement('button');
+		            retryButton.type = 'button';
+		            retryButton.innerText = '↻ 重新加载';
+		            retryButton.addEventListener('click', loadLaserAssets);
+		            status.appendChild(message);
+		            status.appendChild(retryButton);
+		        });
+		    };
+		    loadLaserAssets();
+		    return preview;
+		}
+		function renderGrid(itemList) {
+		    const grid = document.getElementById('videos-grid');
+		    grid.innerHTML = '';
+		    fileUrls = [];
+		    fileNames = [];
+		    laserControlFiles = [];
+		    laserAssetPairs = [];
+		    laserRenderers.forEach(renderer => laserVisibilityObserver?.unobserve(renderer.stage));
+		    laserRenderers.clear();
+		    laserMotionButtons.clear();
+		
+        itemList.forEach((item, index) => {
+            if (!item || !item.card_info) return;
+
+            const cardInfo = item.card_info;
+            const rawVideoUrl = cardInfo.video_list && cardInfo.video_list[0];
+            const rawImgUrl = cardInfo.card_img;
+            const upgradeCoverUrl = cardInfo.meta_info?.upgrade_cover_url;
+
+            if (!rawVideoUrl && !rawImgUrl) return;
+
+            const wrapper = document.createElement('div');
+            wrapper.className = 'media-card';
+
+            const title = document.createElement('div');
+            title.className = 'title';
+            title.innerText = sanitizeFileName(cardInfo.card_name || ('未命名素材 ' + (index + 1)));
+            wrapper._downloadInfo = { title: title.innerText, url: rawVideoUrl || rawImgUrl };
+
+            if (rawVideoUrl) {
+                const video = document.createElement('video');
+                video.controls = true;
+                video.preload = 'metadata';
+                video.referrerPolicy = 'no-referrer';
+                video.setAttribute('playsinline', 'true');
+                attachMediaRetry(video, rawVideoUrl, '视频');
+                video.src = rawVideoUrl;
+                wrapper.appendChild(video);
+
+                fileUrls.push(rawVideoUrl);
+                fileNames.push({
+                    name: title.innerText,
+                    originalUrl: rawVideoUrl,
+                    fetchUrl: rawVideoUrl,
+                    mediaType: 'video',
+                    viaProxy: false
+                });
+            } else if (rawImgUrl && upgradeCoverUrl) {
+                wrapper.classList.add('has-laser');
+                wrapper.appendChild(createLaserPreview(cardInfo, title.innerText));
+                fileUrls.push(rawImgUrl);
+                laserAssetPairs.push({
+                    name: title.innerText,
+                    imageUrl: rawImgUrl,
+                    controlUrl: upgradeCoverUrl
+                });
+                fileNames.push({
+                    name: title.innerText,
+                    originalUrl: rawImgUrl,
+                    fetchUrl: rawImgUrl,
+                    mediaType: 'image',
+                    viaProxy: false
+                });
+            } else {
+                const img = document.createElement('img');
+                img.alt = title.innerText;
+                img.referrerPolicy = 'no-referrer';
+                attachMediaRetry(img, rawImgUrl, '图片');
+                img.src = rawImgUrl;
+                wrapper.appendChild(img);
+
+                fileUrls.push(rawImgUrl);
+                fileNames.push({
+                    name: title.innerText,
+                    originalUrl: rawImgUrl,
+                    fetchUrl: rawImgUrl,
+                    mediaType: 'image',
+                    viaProxy: false
+                });
+            }
+            if (upgradeCoverUrl) {
+                laserControlFiles.push({
+                    name: title.innerText,
+                    originalUrl: upgradeCoverUrl,
+                    fetchUrl: upgradeCoverUrl,
+                    mediaType: 'laser-control',
+                    viaProxy: false
+                });
+            }
+
+            wrapper.appendChild(title);
+            grid.appendChild(wrapper);
+        });
+        }
+		function blobToDataUrl(blob) {
+		    return new Promise((resolve, reject) => {
+		        const reader = new FileReader();
+		        reader.onload = () => typeof reader.result === 'string'
+		            ? resolve(reader.result)
+		            : reject(new Error('图片转换结果无效'));
+		        reader.onerror = () => reject(reader.error || new Error('图片转换失败'));
+		        reader.onabort = () => reject(new Error('图片转换已中止'));
+		        reader.readAsDataURL(blob);
+		    });
+		}
+		async function buildEmbeddedLaserGalleryItems(items, downloadedBlobs) {
+		    const dataUrlCache = new Map();
+		    const getDataUrl = url => {
+		        if (!url || !downloadedBlobs.has(url)) return Promise.resolve(null);
+		        if (!dataUrlCache.has(url)) {
+		            dataUrlCache.set(url, blobToDataUrl(downloadedBlobs.get(url)).catch(error => {
+		                console.warn('镭射图资源嵌入失败：' + url, error);
+		                return null;
+		            }));
+		        }
+		        return dataUrlCache.get(url);
+		    };
+		    const embeddedItems = await Promise.all(items.map(async item => {
+		        const pair = await Promise.all([getDataUrl(item.imageUrl), getDataUrl(item.controlUrl)]);
+		        return { title: item.name, image: pair[0], mask: pair[1] };
+		    }));
+		    return embeddedItems.filter(item => item.image && item.mask);
+		}
+		function buildLaserGalleryHtml(items) {
+		    const galleryData = JSON.stringify(items).replace(/</g, '\\u003c');
+		    return [
+		        '<!DOCTYPE html>',
+		        '<html lang="zh-CN">',
+		        '<head>',
+		        '<meta charset="utf-8">',
+		        '<meta name="viewport" content="width=device-width, initial-scale=1.0">',
+		        '<title>镭射图展示</title>',
+		        '<style>',
+		        ':root{color-scheme:dark;--text:#f8fafc;--muted:#a7b0c3;--line:rgba(255,255,255,.16);--main:#10b981;}',
+		        '*{box-sizing:border-box;}',
+		        'body{margin:0;min-height:100vh;overflow:hidden;color:var(--text);font-family:"Segoe UI","Microsoft YaHei",Arial,sans-serif;background:#020403;}',
+		        '.page{min-height:100vh;display:grid;grid-template-rows:1fr auto;align-items:center;padding:26px 0 32px;}',
+		        '.carousel{position:relative;width:100vw;height:min(76vh,900px);display:flex;align-items:center;justify-content:center;perspective:1200px;touch-action:pan-y;user-select:none;}',
+		        '.side{position:absolute;top:50%;width:min(30vw,260px);height:72%;border-radius:18px;opacity:.72;overflow:hidden;background:#111827;box-shadow:0 28px 80px rgba(0,0,0,.58);transform:translateY(-50%) scale(.86);}',
+		        '.side img{width:100%;height:100%;object-fit:cover;display:block;}',
+		        '.side.prev{left:-7vw;}',
+		        '.side.next{right:-7vw;}',
+		        '.stage{position:relative;width:min(70vw,560px);max-width:calc(100vw - 48px);max-height:100%;border-radius:22px;overflow:hidden;background:#020617;box-shadow:0 34px 110px rgba(0,0,0,.72),0 0 0 1px rgba(255,255,255,.12);cursor:grab;touch-action:none;}',
+		        '.stage:active{cursor:grabbing;}',
+		        'canvas{display:block;width:100%;height:auto;max-height:min(76vh,900px);}',
+		        '.status{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:26px;color:#dbeafe;background:rgba(2,6,23,.9);text-align:center;line-height:1.6;}',
+		        '.nav{display:none;position:absolute;top:50%;width:52px;height:72px;padding:0;border:1px solid var(--line);border-radius:8px;color:#fff;background:rgba(15,23,42,.62);box-shadow:0 16px 38px rgba(0,0,0,.32);transform:translateY(-50%);backdrop-filter:blur(10px);font-size:48px;line-height:1;align-items:center;justify-content:center;}',
+		        '.nav:hover{background:rgba(16,185,129,.78);}',
+		        '.nav.prev{left:18px;}',
+		        '.nav.next{right:18px;}',
+		        '.caption{display:grid;place-items:center;gap:13px;padding:0 18px;text-align:center;}',
+		        '.name{display:flex;align-items:center;justify-content:center;gap:18px;max-width:min(760px,92vw);color:#ece9ff;text-shadow:0 0 20px rgba(168,85,247,.62);font-size:clamp(24px,5vw,42px);font-weight:800;letter-spacing:0;}',
+		        '.name:before,.name:after{content:"";width:min(130px,18vw);height:1px;background:linear-gradient(90deg,transparent,#c4b5fd,transparent);}',
+		        '.actions{display:flex;flex-wrap:wrap;gap:10px;justify-content:center;}',
+		        'button{border:1px solid rgba(255,255,255,.18);border-radius:8px;padding:10px 16px;color:#fff;background:rgba(16,185,129,.9);font:inherit;font-weight:800;cursor:pointer;box-shadow:0 12px 28px rgba(16,185,129,.22);}',
+		        'button.secondary{background:rgba(30,41,59,.82);box-shadow:none;}',
+		        'button:disabled{opacity:.5;cursor:not-allowed;}',
+		        '.counter{color:var(--muted);font-size:13px;}',
+		        '@media (min-width:1025px) and (hover:hover) and (pointer:fine){.side{width:min(30vw,400px);}.side.prev{left:50%;right:auto;transform:translate(calc(-50% - min(39vw,500px)),-50%) scale(.86);}.side.next{left:50%;right:auto;transform:translate(calc(-50% + min(39vw,500px)),-50%) scale(.86);}.nav{display:flex;}.nav.prev{left:50%;right:auto;transform:translate(calc(-50% - min(36vw,430px)),-50%);}.nav.next{left:50%;right:auto;transform:translate(calc(-50% + min(36vw,430px)),-50%);}}',
+		        '@media (max-width:1024px){.side{width:min(34vw,180px);height:66%;border-radius:14px;}.side.prev{left:50%;right:auto;transform:translate(calc(-50% - min(56vw,430px)),-50%) scale(.86);}.side.next{left:50%;right:auto;transform:translate(calc(-50% + min(56vw,430px)),-50%) scale(.86);}}',
+		        '@media (max-width:700px){.page{padding:16px 0 22px;}.carousel{height:68vh;}.stage{width:min(82vw,520px);max-width:calc(100vw - 40px);border-radius:18px;}button{padding:9px 12px;font-size:14px;}}',
+		        '</style>',
+		        '</head>',
+		        '<body>',
+		        '<main class="page">',
+		        '<section class="carousel" id="carousel">',
+		        '<div class="side prev"><img id="prev-img" alt=""></div>',
+		        '<div class="stage" id="stage"><canvas id="canvas" width="828" height="1242"></canvas><div class="status" id="status">正在加载镭射图...</div></div>',
+		        '<div class="side next"><img id="next-img" alt=""></div>',
+		        '<button class="nav prev" id="prev-btn" type="button">‹</button>',
+		        '<button class="nav next" id="next-btn" type="button">›</button>',
+		        '</section>',
+		        '<section class="caption"><div class="name" id="name">镭射图</div><div class="actions"><button id="toggle-btn" type="button">关闭镭射</button><button id="save-btn" class="secondary" type="button">保存效果</button><button id="motion-btn" class="secondary" type="button">开启晃动</button></div><div class="counter" id="counter"></div></section>',
+		        '</main>',
+		        '<script>',
+		        'const ITEMS=' + galleryData + ';',
+		        'const state={index:0,enabled:true,ready:false,baseImage:null,maskImage:null,pointerX:.5,pointerY:.5,motionEnabled:false,motionListening:false,motionBaseline:null};',
+		        'const canvas=document.getElementById("canvas"),ctx=canvas.getContext("2d"),maskCanvas=document.createElement("canvas"),effectCanvas=document.createElement("canvas"),stage=document.getElementById("stage"),statusBox=document.getElementById("status"),nameBox=document.getElementById("name"),counterBox=document.getElementById("counter"),toggleBtn=document.getElementById("toggle-btn"),saveBtn=document.getElementById("save-btn"),motionBtn=document.getElementById("motion-btn");',
+		        'function fileSrc(path){const source=String(path||"");return /^(?:data|blob):/i.test(source)?source:source.split("/").map(encodeURIComponent).join("/");}',
+		        'function mod(value,divisor){return ((value%divisor)+divisor)%divisor;}',
+		        'function cleanName(name){return String(name||"镭射图").replace(/[\\\\/:*?"<>|]/g,"").trim()||"镭射图";}',
+		        'function loadImage(path){return new Promise((resolve,reject)=>{const img=new Image();img.onload=()=>resolve(img);img.onerror=()=>reject(new Error("图片加载失败："+path));img.src=fileSrc(path);});}',
+		        'function resizeCanvases(){const width=Math.min(1400,state.baseImage.naturalWidth||state.baseImage.width||828);const height=Math.round(width*(state.baseImage.naturalHeight||state.baseImage.height||1242)/(state.baseImage.naturalWidth||state.baseImage.width||828));canvas.width=width;canvas.height=height;maskCanvas.width=width;maskCanvas.height=height;effectCanvas.width=width;effectCanvas.height=height;}',
+		        'function draw(timestamp){if(!state.ready)return;const width=canvas.width,height=canvas.height;ctx.globalAlpha=1;ctx.globalCompositeOperation="source-over";ctx.clearRect(0,0,width,height);ctx.drawImage(state.baseImage,0,0,width,height);if(!state.enabled)return;const ectx=effectCanvas.getContext("2d");const phase=mod(timestamp*.000045+state.pointerX*.55+state.pointerY*.2,1);const angle=(-55+state.pointerX*70)*Math.PI/180;const cx=width/2,cy=height/2,radius=Math.hypot(width,height)*.72;const x0=cx-Math.cos(angle)*radius,y0=cy-Math.sin(angle)*radius,x1=cx+Math.cos(angle)*radius,y1=cy+Math.sin(angle)*radius;ectx.globalAlpha=1;ectx.globalCompositeOperation="source-over";ectx.clearRect(0,0,width,height);const rainbow=ectx.createLinearGradient(x0,y0,x1,y1);for(let i=0;i<=10;i++)rainbow.addColorStop(i/10,"hsl("+mod((i/10+phase)*360,360)+" 94% 58%)");ectx.fillStyle=rainbow;ectx.fillRect(0,0,width,height);ectx.globalCompositeOperation="multiply";ectx.filter="contrast(170%) brightness(118%)";ectx.drawImage(state.maskImage,0,0,width,height);ectx.filter="none";ctx.globalCompositeOperation="screen";ctx.globalAlpha=.44;ctx.drawImage(effectCanvas,0,0);ectx.globalCompositeOperation="source-over";ectx.clearRect(0,0,width,height);const shine=ectx.createLinearGradient(x0,y0,x1,y1),center=mod(phase*1.35,1),sw=.075;[[0,"rgba(255,255,255,0)"],[Math.max(0,center-sw),"rgba(255,255,255,0)"],[center,"rgba(255,255,255,.95)"],[Math.min(1,center+sw),"rgba(255,255,255,0)"],[1,"rgba(255,255,255,0)"]].sort((a,b)=>a[0]-b[0]).forEach(stop=>shine.addColorStop(stop[0],stop[1]));ectx.fillStyle=shine;ectx.fillRect(0,0,width,height);ectx.globalCompositeOperation="multiply";ectx.filter="contrast(190%) brightness(125%)";ectx.drawImage(state.maskImage,0,0,width,height);ectx.filter="none";ctx.globalCompositeOperation="screen";ctx.globalAlpha=.24;ctx.drawImage(effectCanvas,0,0);ctx.globalAlpha=1;ctx.globalCompositeOperation="source-over";}',
+		        'function animate(timestamp){draw(timestamp);requestAnimationFrame(animate);}',
+		        'async function show(index){if(!ITEMS.length){statusBox.textContent="这个压缩包里没有可展示的镭射图。";return;}state.index=mod(index,ITEMS.length);state.ready=false;statusBox.style.display="flex";statusBox.textContent="正在加载镭射图...";const item=ITEMS[state.index],prev=ITEMS[mod(state.index-1,ITEMS.length)],next=ITEMS[mod(state.index+1,ITEMS.length)];nameBox.textContent=item.title||"镭射图";counterBox.textContent=(state.index+1)+" / "+ITEMS.length;document.getElementById("prev-img").src=fileSrc(prev.image);document.getElementById("next-img").src=fileSrc(next.image);try{const images=await Promise.all([loadImage(item.image),loadImage(item.mask)]);state.baseImage=images[0];state.maskImage=images[1];resizeCanvases();state.ready=true;statusBox.style.display="none";draw(performance.now());}catch(error){statusBox.textContent=error.message;}}',
+		        'function change(delta){show(state.index+delta);}',
+		        'function orientationAngle(){const angle=screen.orientation?.angle??window.orientation??0;return ((Number(angle)%360)+360)%360;}',
+		        'function tiltDelta(value){return ((value+180)%360+360)%360-180;}',
+		        'function handleOrientation(event){if(!state.motionEnabled||event.beta==null||event.gamma==null)return;const angle=orientationAngle();if(!state.motionBaseline||state.motionBaseline.angle!==angle){state.motionBaseline={beta:event.beta,gamma:event.gamma,angle};motionBtn.textContent="晃动已开启";return;}const beta=tiltDelta(event.beta-state.motionBaseline.beta),gamma=tiltDelta(event.gamma-state.motionBaseline.gamma);let horizontal=gamma,vertical=beta;if(angle===90){horizontal=beta;vertical=-gamma;}else if(angle===270){horizontal=-beta;vertical=gamma;}else if(angle===180){horizontal=-gamma;vertical=-beta;}state.pointerX+=(Math.max(0,Math.min(1,.5+horizontal/60))-state.pointerX)*.35;state.pointerY+=(Math.max(0,Math.min(1,.5+vertical/60))-state.pointerY)*.35;}',
+		        'async function enableMotion(){if(typeof DeviceOrientationEvent==="undefined"){alert("当前浏览器或设备不支持晃动感应。");return;}try{if(!state.motionEnabled&&typeof DeviceOrientationEvent.requestPermission==="function"){const permission=await DeviceOrientationEvent.requestPermission();if(permission!=="granted")throw new Error("未获得动作与方向访问权限");}if(!state.motionListening){window.addEventListener("deviceorientation",handleOrientation,true);state.motionListening=true;}state.motionEnabled=true;state.motionBaseline=null;motionBtn.textContent="请晃动手机";}catch(error){alert("无法开启晃动感应："+error.message);}}',
+		        'stage.addEventListener("pointermove",event=>{const rect=stage.getBoundingClientRect();state.pointerX=Math.max(0,Math.min(1,(event.clientX-rect.left)/rect.width));state.pointerY=Math.max(0,Math.min(1,(event.clientY-rect.top)/rect.height));draw(performance.now());});',
+		        'let startX=0;stage.addEventListener("pointerdown",event=>{startX=event.clientX;});stage.addEventListener("pointerup",event=>{const diff=event.clientX-startX;if(Math.abs(diff)>42)change(diff>0?-1:1);});',
+		        'document.getElementById("prev-btn").addEventListener("click",()=>change(-1));document.getElementById("next-btn").addEventListener("click",()=>change(1));',
+		        'toggleBtn.addEventListener("click",()=>{state.enabled=!state.enabled;toggleBtn.textContent=state.enabled?"关闭镭射":"开启镭射";draw(performance.now());});',
+		        'saveBtn.addEventListener("click",()=>{if(!state.ready)return;draw(performance.now());try{canvas.toBlob(blob=>{if(!blob){alert("当前浏览器禁止保存本地图片合成结果，可以用本地服务器方式打开此 HTML 后再试。");return;}const url=URL.createObjectURL(blob),link=document.createElement("a");link.href=url;link.download=cleanName(ITEMS[state.index]?.title)+"_镭射效果.png";document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);},"image/png");}catch(error){alert("当前浏览器禁止保存本地图片合成结果，可以用本地服务器方式打开此 HTML 后再试。");}});',
+		        'motionBtn.addEventListener("click",enableMotion);',
+		        'if(!(navigator.userAgentData?.mobile===true||/Android|iPhone|iPad|iPod|Mobile|HarmonyOS/i.test(navigator.userAgent)||(navigator.platform==="MacIntel"&&navigator.maxTouchPoints>1)))motionBtn.style.display="none";',
+		        'document.addEventListener("keydown",event=>{if(event.key==="ArrowLeft")change(-1);if(event.key==="ArrowRight")change(1);});',
+		        'show(0);requestAnimationFrame(animate);',
+		        '<\\/script>',
+		        '</body>',
+		        '</html>'
+		    ].join('\\n');
+		}
+		function buildSourceLinkHtml(title, sourceUrl) {
+		    const escapeHtml = value => String(value || '').replace(/[&<>"']/g, char => ({
+		        '&': '&amp;',
+		        '<': '&lt;',
+		        '>': '&gt;',
+		        '"': '&quot;',
+		        "'": '&#39;'
+		    }[char]));
+		    const safeTitle = escapeHtml(title || '数字周边');
+		    const safeUrl = escapeHtml(sourceUrl || '');
+		    const jsUrl = JSON.stringify(String(sourceUrl || '')).replace(/</g, '\\u003c');
+		    return [
+		        '<!DOCTYPE html>',
+		        '<html lang="zh-CN">',
+		        '<head>',
+		        '<meta charset="utf-8">',
+		        '<meta name="viewport" content="width=device-width, initial-scale=1.0">',
+		        '<title>' + safeTitle + '</title>',
+		        '<style>',
+		        '*{box-sizing:border-box;}',
+		        'body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;color:#172033;font-family:"Segoe UI","Microsoft YaHei",Arial,sans-serif;background:linear-gradient(135deg,#f8fafc,#ecfdf5,#fff7ed);}',
+		        'main{width:min(520px,100%);padding:28px;border:1px solid #dce4ee;border-radius:12px;background:rgba(255,255,255,.9);box-shadow:0 18px 60px rgba(15,23,42,.12);text-align:center;}',
+		        'h1{margin:0 0 12px;font-size:24px;letter-spacing:0;}',
+		        'p{margin:0 0 18px;color:#64748b;line-height:1.65;}',
+		        'a{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:10px 18px;border-radius:8px;color:#fff;background:#10b981;font-weight:800;text-decoration:none;box-shadow:0 12px 26px rgba(16,185,129,.25);}',
+		        '.url{margin-top:16px;color:#64748b;font-size:12px;overflow-wrap:anywhere;}',
+		        '</style>',
+		        '</head>',
+		        '<body>',
+		        '<main>',
+		        '<h1>' + safeTitle + '</h1>',
+		        '<p>正在跳转到原数字周边链接，若没有自动打开，请点击下方按钮。</p>',
+		        '<a href="' + safeUrl + '" id="open-link">打开数字周边</a>',
+		        '<div class="url">' + safeUrl + '</div>',
+		        '</main>',
+		        '<script>',
+		        'const targetUrl=' + jsUrl + ';',
+		        'if(targetUrl){setTimeout(()=>{window.location.href=targetUrl;},300);}',
+		        '<\\/script>',
+		        '</body>',
+		        '</html>'
+		    ].join('\\n');
+		}
+		async function downloadSuitFilesAsZip() {
+			if (!suitResources.length) { alert('没有可下载的装扮资源！'); return; }
+			if (isDownloading) { alert('当前有正在进行的下载任务，请等待其完成后再试！'); return; }
+			const resources=suitResources.map(resource=>Object.assign({},resource)), zipNameSafe=sanitizeFileName(suitZipName,'装扮资源'), progressContainer=document.getElementById('progress-container'), progressBar=document.getElementById('download-progress'), progressText=document.getElementById('progressText'), downloadButton=document.getElementById('download-btn'), zip=new JSZip(), names=new Map();
+			let nextIndex=0, completed=0;
+			const uniqueName=(directory,name)=>{ const key=directory+'/'+name,count=names.get(key)||0; names.set(key,count+1); return count ? name+'_'+count : name; };
+			const updateProgress=()=>{ const percent=Math.floor((completed/resources.length)*80); progressBar.value=percent; progressText.innerText='正在下载 ['+zipNameSafe+']... '+percent+'% ('+completed+'/'+resources.length+')'; };
+			const worker=async()=>{ while(nextIndex<resources.length) { const resource=resources[nextIndex++], directory=resource.subDir||resource.category||'未分类', baseName=sanitizeFileName(resource.name,'未命名素材'); try { const response=await fetchWithRetry(resource.url,{referrerPolicy:'no-referrer'},3,30000),blob=await response.blob(),extension=inferExtFromUrlOrBlob(resource.url,blob),fileName=uniqueName(directory,baseName)+extension; zip.file(directory+'/'+fileName,blob); } catch(error) { zip.file(directory+'/'+uniqueName(directory,baseName)+'_下载失败.txt','下载失败文件：'+baseName+'\\n原链接：'+resource.url+'\\n错误信息：'+error.message); } finally { completed++; updateProgress(); } } };
+			isDownloading=true; progressContainer.style.display='block'; progressBar.value=0; downloadButton.disabled=true;
+			try { await Promise.all(Array.from({length:Math.min(2,resources.length)},worker)); progressText.innerText='资源下载完成，正在压缩中，请稍候...'; const content=await zip.generateAsync({type:'blob'},metadata=>{const percent=Math.min(100,80+Math.floor((metadata.percent||0)*0.2));progressBar.value=percent;progressText.innerText='正在压缩 ['+zipNameSafe+']... '+percent+'%';}); saveAs(content,zipNameSafe+'.zip'); progressBar.value=100;progressText.innerText='压缩完毕！文件已保存。'; } catch(error) { alert('打包下载失败：'+error.message); } finally { setTimeout(()=>{progressContainer.style.display='none';progressBar.value=0;isDownloading=false;downloadButton.disabled=false;},1500); }
+		}
+		async function downloadFilesAsZip() {
+		    if (fileUrls.length === 0) { alert('没有找到可以下载的资源文件！'); return; }
+		    if (isDownloading) { alert('当前有正在进行的下载任务，请等待其完成后再试！'); return; }
+		    const targetUrls = [...fileUrls];
+		    const targetData = [...fileNames];
+		    const targetLaserControls = laserControlFiles.map(item => ({ ...item }));
+		    const targetLaserPairs = laserAssetPairs.map(item => ({ ...item }));
+		    const targetZipName = sanitizeFileName(zipName, '数字周边');
+		    const sourceLink = document.getElementById('source-url').value.trim();
+		    const createUniqueFileNames = (items, fallbackPrefix) => {
+		        const nameOccurrenceMap = {};
+		        return items.map((item, index) => {
+		            const safeName = sanitizeFileName(item?.name, fallbackPrefix + '_' + (index + 1));
+		            if (nameOccurrenceMap[safeName] !== undefined) {
+		                nameOccurrenceMap[safeName]++;
+		                return safeName + '_' + nameOccurrenceMap[safeName];
+		            }
+		            nameOccurrenceMap[safeName] = 0;
+		            return safeName;
+		        });
+		    };
+		    const finalFileNames = createUniqueFileNames(targetData, '未命名素材');
+		    const finalLaserControlNames = createUniqueFileNames(targetLaserControls, '未命名镭射效果控制图');
+		    const downloadTasks = targetData.map((meta, index) => ({
+		        currentUrl: targetUrls[index],
+		        meta,
+		        baseName: finalFileNames[index],
+		        directory: ''
+		    })).concat(targetLaserControls.map((meta, index) => ({
+		        currentUrl: meta.fetchUrl || meta.originalUrl,
+		        meta,
+		        baseName: finalLaserControlNames[index],
+		        directory: '镭射效果控制图/'
+		    })));
+		    const progressContainer = document.getElementById('progress-container');
+		    const progressBar = document.getElementById('download-progress');
+		    const progressText = document.getElementById('progressText');
+		    const downloadBtn = document.getElementById('download-btn');
+		    isDownloading = true;
+		    progressContainer.style.display = 'block';
+		    progressBar.value = 0;
+		    progressText.innerText = '准备下载...';
+		    downloadBtn.disabled = true;
+		    const zip = new JSZip();
+		    const downloadedBlobs = new Map();
+		    let completedCount = 0;
+		    const CONCURRENCY_LIMIT = 2;
+		    let currentIndex = 0;
+		    const updateProgress = () => {
+		        const percent = Math.floor((completedCount / downloadTasks.length) * 100);
+		        progressBar.value = percent;
+		        progressText.innerText = \`正在下载 [\${targetZipName}]... 进度 \${percent}% (\${completedCount}/\${downloadTasks.length})\`;
+		    };
+		    const downloadWorker = async () => {
+		        while (currentIndex < downloadTasks.length) {
+		            const index = currentIndex++;
+		const task = downloadTasks[index];
+		const currentUrl = task.currentUrl;
+		const meta = task.meta || {};
+		const originalUrl = meta.originalUrl || currentUrl;
+		const fetchUrl = meta.fetchUrl || currentUrl;
+		const mediaType = meta.mediaType || 'unknown';
+		const viaProxy = !!meta.viaProxy;
+		const baseName = task.baseName;
+		const directory = task.directory;
+		let inferredExt = '.bin';
+		
+		try {
+		    const response = await fetchWithRetry(fetchUrl, {
+		    referrerPolicy: 'no-referrer',
+		    headers: {
+		        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
+		    }
+		}, 3, 30000);
+		    const blob = await response.blob();
+		    inferredExt = inferExtFromUrlOrBlob(originalUrl, blob);
+		    const fileName = directory + baseName + inferredExt;
+		    zip.file(fileName, blob);
+		    downloadedBlobs.set(originalUrl, blob);
+		    downloadedBlobs.set(fetchUrl, blob);
+		} catch (error) {
+		    zip.file(
+		directory + baseName + '_下载失败记录_' + (index + 1) + '.txt',
+		'下载地址: ' + fetchUrl + '\\n'
+		+ '原始链接: ' + originalUrl + '\\n'
+		+ '资源类型: ' + mediaType + '\\n'
+		+ '是否经代理: ' + (viaProxy ? '是' : '否') + '\\n'
+		+ '推断扩展名: ' + inferredExt + '\\n'
+		+ '错误: ' + error.message
+		    );
+		} finally {
+		                completedCount++;
+		                updateProgress();
+		            }
+		        }
+		    };
+		    try {
+		        await Promise.all(Array.from({ length: Math.min(CONCURRENCY_LIMIT, downloadTasks.length) }, () => downloadWorker()));
+		        progressText.innerText = '正在生成不依赖外部图片的镭射图展示页面...';
+		        const laserGalleryItems = await buildEmbeddedLaserGalleryItems(targetLaserPairs, downloadedBlobs);
+		        if (laserGalleryItems.length > 0) {
+		            zip.file('镭射图展示.html', buildLaserGalleryHtml(laserGalleryItems));
+		        }
+		        if (sourceLink) {
+		            zip.file(sanitizeFileName(targetZipName, '数字周边') + '.html', buildSourceLinkHtml(targetZipName, sourceLink));
+		        }
+		        progressText.innerText = '资源下载完成，正在拼命压缩中，请稍候...';
+		        const content = await zip.generateAsync({ type: 'blob' });
+		        saveAs(content, \`\${targetZipName}.zip\`);
+		        progressText.innerText = '压缩完毕！文件已保存。';
+		    } catch (error) {
+		        alert(\`打包下载失败：\${error.message}\`);
+		    } finally {
+		        setTimeout(() => {
+		            progressContainer.style.display = 'none';
+		            progressBar.value = 0;
+		            isDownloading = false;
+		            downloadBtn.disabled = false;
+		        }, 1500);
+		    }
+		}
+	</script>
+</body>
+</html>
+`;
